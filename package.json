@@ -2,16 +2,12 @@
   "name": "etr-render-deploy",
   "version": "0.1.0",
   "private": true,
-  "description": "WordPress architecture extractor + manifest schema + wrapper API",
+  "description": "Deploy-focused mirror for the ETR API and worker services",
   "type": "module",
   "engines": {
     "node": ">=20.0.0"
   },
   "scripts": {
-    "cli": "node src/cli.js",
-    "build:manifest": "node src/cli.js build",
-    "transfer:db": "node src/cli.js transfer-db",
-    "sync:backfill": "node src/cli.js backfill-sync",
     "api": "node src/server.js",
     "api:dev": "npm --prefix apps/api run dev",
     "api:start": "npm --prefix apps/api run start",

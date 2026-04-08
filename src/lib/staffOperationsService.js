@@ -107,6 +107,14 @@ function normalizeMessageRow(row = {}, pendingActions = []) {
   };
 }
 
+function normalizeAgentId(value) {
+  const normalized = trimText(value, "vincent").toLowerCase();
+  if (["vincent", "tessa", "mira"].includes(normalized)) {
+    return normalized;
+  }
+  return "vincent";
+}
+
 function normalizeStreamEvent(row = {}) {
   return {
     cursor: `${row.cursor ?? row.id ?? ""}`,
@@ -594,10 +602,11 @@ export class StaffOperationsService {
     }
   }
 
-  async createAgentThread(actor = {}) {
+  async createAgentThread(actor = {}, input = {}) {
     await this.ensureReady();
     const opsSchema = quoteIdentifier(this.opsSchema);
     const resolvedActor = buildActor(actor);
+    const agentId = normalizeAgentId(input.agent_id || input.agentId);
     const response = await this.client.query(
       `
         INSERT INTO ${opsSchema}.agent_threads (id, created_by, created_by_email, status)
@@ -606,13 +615,17 @@ export class StaffOperationsService {
       `,
       [randomUUID(), resolvedActor.userId, resolvedActor.email || null]
     );
-    return response.rows[0];
+    return {
+      ...response.rows[0],
+      agent_id: agentId
+    };
   }
 
   async postAgentMessage(threadId, input = {}, actor = {}) {
     await this.ensureReady();
     const opsSchema = quoteIdentifier(this.opsSchema);
     const resolvedActor = buildActor(actor);
+    const agentId = normalizeAgentId(input.agent_id || input.agentId);
     const message = trimText(input.message);
     if (!message) {
       throw new Error("agent_message_required");
@@ -642,7 +655,8 @@ export class StaffOperationsService {
           message,
           resolvedActor.userId,
           JSON.stringify({
-            user_email: resolvedActor.email || null
+            user_email: resolvedActor.email || null,
+            agent_id: agentId
           })
         ]
       );
@@ -657,7 +671,7 @@ export class StaffOperationsService {
       throw error;
     }
 
-    const outcome = await this.buildAgentOutcome(message, threadId, resolvedActor);
+    const outcome = await this.buildAgentOutcome(message, threadId, resolvedActor, agentId);
 
     await this.client.query("BEGIN");
     try {
@@ -675,7 +689,8 @@ export class StaffOperationsService {
           threadId,
           outcome.reply,
           JSON.stringify({
-            pending_action_ids: outcome.pendingActions.map((action) => action.id)
+            pending_action_ids: outcome.pendingActions.map((action) => action.id),
+            agent_id: agentId
           })
         ]
       );
@@ -1309,7 +1324,8 @@ export class StaffOperationsService {
     );
   }
 
-  async buildAgentOutcome(message, threadId, actor) {
+  async buildAgentOutcome(message, threadId, actor, agentId = "vincent") {
+    const resolvedAgentId = normalizeAgentId(agentId);
     const taskDraft = buildAgentTaskDraft(message);
     if (taskDraft) {
       const startLabel = new Date(taskDraft.start_at).toLocaleString("en-US", {
@@ -1348,6 +1364,34 @@ export class StaffOperationsService {
       return checkout && checkout >= todayStart && checkout < tomorrowStart;
     }).length;
     const urgentTasks = dashboard.tasks.filter((task) => task.priority === "urgent").length;
+    const unassignedTasks = dashboard.tasks.filter((task) => {
+      return !dashboard.assignments.some((assignment) => assignment.task_id === task.id);
+    }).length;
+    const activeManagers = dashboard.people.filter((person) => `${person.role || ""}`.trim().toLowerCase() === "manager" && person.is_active).length;
+    const activeEmployees = dashboard.people.filter((person) => `${person.role || ""}`.trim().toLowerCase() === "employee" && person.is_active).length;
+    const upcomingWindowEnd = addDays(todayStart, 3);
+    const upcomingArrivals = dashboard.reservations.filter((reservation) => {
+      const checkin = reservation.checkin_at ? new Date(reservation.checkin_at) : null;
+      return checkin && checkin >= todayStart && checkin < upcomingWindowEnd;
+    }).length;
+    const upcomingDepartures = dashboard.reservations.filter((reservation) => {
+      const checkout = reservation.checkout_at ? new Date(reservation.checkout_at) : null;
+      return checkout && checkout >= todayStart && checkout < upcomingWindowEnd;
+    }).length;
+
+    if (resolvedAgentId === "tessa") {
+      return {
+        reply: `Tessa focus: there are ${dashboard.tasks.length} scheduled tasks, ${urgentTasks} urgent task(s), and ${unassignedTasks} unassigned task(s). Active staffing currently shows ${activeManagers} manager(s) and ${activeEmployees} employee(s).`,
+        pendingActions: []
+      };
+    }
+
+    if (resolvedAgentId === "mira") {
+      return {
+        reply: `Mira focus: today there are ${todayArrivals} arrivals and ${todayDepartures} departures. In the next 72 hours there are ${upcomingArrivals} arrivals and ${upcomingDepartures} departures to prepare for.`,
+        pendingActions: []
+      };
+    }
 
     return {
       reply: `Today there are ${todayArrivals} arrivals, ${todayDepartures} departures, and ${dashboard.tasks.length} scheduled tasks in the active window. ${urgentTasks > 0 ? `${urgentTasks} task(s) are marked urgent.` : "No urgent tasks are currently flagged."}`,

@@ -166,7 +166,7 @@ export function registerStaffRoutes(app, { staffAuthService, staffOperationsServ
 
   router.post("/agent/threads", async (req, res) => {
     try {
-      const thread = await staffOperationsService.createAgentThread(buildActor(req.staffUser));
+      const thread = await staffOperationsService.createAgentThread(buildActor(req.staffUser), req.body || {});
       return res.status(201).json(thread);
     } catch (error) {
       return res.status(errorStatus(error)).json({
