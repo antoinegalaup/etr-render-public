@@ -16,6 +16,9 @@ export function buildPgConnectionOptions(databaseUrl) {
   try {
     const parsed = new URL(rawUrl);
     const sslMode = `${parsed.searchParams.get("sslmode") || ""}`.trim().toLowerCase();
+    if (sslMode === "no-verify") {
+      return { connectionString: rawUrl };
+    }
     const shouldDisableSsl = sslMode === "disable";
     const shouldRelaxSsl =
       !shouldDisableSsl &&
