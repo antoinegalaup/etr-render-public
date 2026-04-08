@@ -290,6 +290,14 @@ export function createApp({
     res.json({ status: "ok" });
   });
 
+  app.get("/", (_req, res) => {
+    res.json({
+      service: "etr-api",
+      status: "ok",
+      health: "/health"
+    });
+  });
+
   app.get("/architecture", (_req, res) => {
     if (!exposeArchitectureRoutes) {
       return res.status(404).json({ error: "not_found" });
