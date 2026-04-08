@@ -1,0 +1,6 @@
+{
+  "name": "@etr-platform/config",
+  "private": true,
+  "type": "module",
+  "description": "Shared environment parsing and runtime configuration helpers for the ETR platform"
+}

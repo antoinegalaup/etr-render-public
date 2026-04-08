@@ -1,0 +1,118 @@
+services:
+  - type: web
+    name: etr-api
+    env: node
+    rootDir: .
+    buildCommand: npm ci
+    startCommand: npm --prefix apps/api run start
+    healthCheckPath: /health
+    autoDeploy: false
+    envVars:
+      - key: NODE_ENV
+        value: production
+      - key: SYNC_INGEST_ENABLED
+        value: "true"
+      - key: SYNC_SCHEMA
+        value: sync
+      - key: SYNC_DATABASE_URL
+        sync: false
+      - key: SYNC_HMAC_SECRET
+        sync: false
+      - key: SUPABASE_URL
+        sync: false
+      - key: SUPABASE_ANON_KEY
+        sync: false
+      - key: SUPABASE_SERVICE_ROLE_KEY
+        sync: false
+      - key: STAFF_ALLOWED_EMAILS
+        sync: false
+      - key: STAFF_ALLOWED_EMAIL_DOMAINS
+        sync: false
+      - key: STAFF_AUTH_RELAXED
+        value: "false"
+      - key: EXPOSE_ARCHITECTURE_ROUTES
+        value: "false"
+      - key: PUBLIC_RATE_LIMIT_ENABLED
+        value: "true"
+      - key: PUBLIC_RATE_LIMIT_WINDOW_MS
+        value: "60000"
+      - key: PUBLIC_RATE_LIMIT_PROPERTIES_MAX
+        value: "120"
+      - key: PUBLIC_RATE_LIMIT_AVAILABILITY_MAX
+        value: "60"
+      - key: PUBLIC_RATE_LIMIT_QUOTES_MAX
+        value: "20"
+      - key: PUBLIC_RATE_LIMIT_CHECKOUT_MAX
+        value: "20"
+      - key: PUBLIC_RATE_LIMIT_CHAT_MAX
+        value: "12"
+      - key: PUBLIC_RATE_LIMIT_PORTAL_MAX
+        value: "10"
+      - key: PORTAL_SESSION_SECRET
+        sync: false
+      - key: INTERNAL_API_SECRET
+        sync: false
+      - key: OPENAI_API_KEY
+        sync: false
+      - key: STRIPE_SECRET_KEY
+        sync: false
+      - key: STRIPE_WEBHOOK_SECRET
+        sync: false
+      - key: WORDPRESS_BASE_URL
+        sync: false
+      - key: WORDPRESS_PUBLIC_BASE_URL
+        sync: false
+      - key: WORDPRESS_COMMAND_ENDPOINT
+        value: /wp-json/wpshell-sync/v1/commands
+      - key: WORDPRESS_COMMAND_SECRET
+        sync: false
+  - type: worker
+    name: etr-workers
+    env: node
+    rootDir: .
+    buildCommand: npm ci
+    startCommand: npm --prefix apps/workers run start
+    autoDeploy: false
+    envVars:
+      - key: NODE_ENV
+        value: production
+      - key: WORKER_MODE
+        value: service
+      - key: WORKER_VIKBOOKING_SYNC_ENABLED
+        value: "false"
+      - key: WORKER_VIKBOOKING_SYNC_INTERVAL_MS
+        value: "300000"
+      - key: WORKER_COMMAND_QUEUE_ENABLED
+        value: "true"
+      - key: WORKER_COMMAND_QUEUE_INTERVAL_MS
+        value: "15000"
+      - key: WORKER_RECONCILIATION_ENABLED
+        value: "true"
+      - key: WORKER_RECONCILIATION_INTERVAL_MS
+        value: "60000"
+      - key: WORKER_DATABASE_URL
+        sync: false
+      - key: SYNC_SCHEMA
+        value: sync
+      - key: SYNC_HMAC_SECRET
+        sync: false
+      - key: WORDPRESS_BASE_URL
+        sync: false
+      - key: WORDPRESS_PUBLIC_BASE_URL
+        sync: false
+      - key: WORDPRESS_COMMAND_ENDPOINT
+        value: /wp-json/wpshell-sync/v1/commands
+      - key: WORDPRESS_COMMAND_SECRET
+        sync: false
+      - key: DB_TRANSFER_SOURCE_HOST
+        sync: false
+      - key: DB_TRANSFER_SOURCE_PORT
+        sync: false
+      - key: DB_TRANSFER_SOURCE_USER
+        sync: false
+      - key: DB_TRANSFER_SOURCE_PASSWORD
+        sync: false
+      - key: DB_TRANSFER_SOURCE_DATABASE
+        sync: false
+      - key: DB_TRANSFER_SOURCE_PREFIX
+        value: wp_

@@ -1,0 +1,10 @@
+{
+  "name": "etr-platform-workers",
+  "private": true,
+  "type": "module",
+  "description": "Background workers for the ETR platform",
+  "scripts": {
+    "once": "WORKER_MODE=once node src/index.js",
+    "start": "node src/index.js"
+  }
+}

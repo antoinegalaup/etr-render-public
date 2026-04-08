@@ -1,0 +1,10 @@
+{
+  "name": "etr-platform-api",
+  "private": true,
+  "type": "module",
+  "description": "Logical API app boundary for the ETR platform",
+  "scripts": {
+    "dev": "node ../../src/server.js",
+    "start": "node ../../src/server.js"
+  }
+}

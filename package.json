@@ -1,0 +1,29 @@
+{
+  "name": "etr-render-deploy",
+  "version": "0.1.0",
+  "private": true,
+  "description": "WordPress architecture extractor + manifest schema + wrapper API",
+  "type": "module",
+  "engines": {
+    "node": ">=20.0.0"
+  },
+  "scripts": {
+    "cli": "node src/cli.js",
+    "build:manifest": "node src/cli.js build",
+    "transfer:db": "node src/cli.js transfer-db",
+    "sync:backfill": "node src/cli.js backfill-sync",
+    "api": "node src/server.js",
+    "api:dev": "npm --prefix apps/api run dev",
+    "api:start": "npm --prefix apps/api run start",
+    "workers:start": "npm --prefix apps/workers run start",
+    "workers:once": "npm --prefix apps/workers run once"
+  },
+  "dependencies": {
+    "ajv": "^8.17.1",
+    "ajv-formats": "^3.0.1",
+    "commander": "^12.1.0",
+    "express": "^4.21.2",
+    "mysql2": "^3.17.0",
+    "pg": "^8.18.0"
+  }
+}
