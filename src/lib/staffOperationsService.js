@@ -92,9 +92,27 @@ function normalizeGaelReply(value) {
   if (!lines.length) {
     return "";
   }
-  return lines
+  const normalizedLines = lines
     .map((line) => (/^(-|\d+\.)\s/.test(line) ? line : `- ${line}`))
-    .join("\n");
+    .filter((line, index, allLines) => {
+      if (index === 0 && allLines.length > 1 && /^-\s+(based on|summary|recommendation|here)/i.test(line)) {
+        return false;
+      }
+      return true;
+    })
+    .slice(0, 3)
+    .map((line) => {
+      const prefixMatch = line.match(/^(-|\d+\.)\s+/);
+      const prefix = prefixMatch ? prefixMatch[0] : "- ";
+      const body = trimText(line.replace(/^(-|\d+\.)\s+/, ""))
+        .replace(/:+$/g, "")
+        .split(/\s+/)
+        .slice(0, 14)
+        .join(" ");
+      return `${prefix}${body}`;
+    })
+    .filter((line) => !/^(-|\d+\.)\s*$/.test(line));
+  return normalizedLines.join("\n");
 }
 
 function buildActor(actor = {}, fallbackSource = "user") {
@@ -318,6 +336,200 @@ function buildAgentTaskDraft(message) {
   };
 }
 
+function looksLikeGaelPlanningRequest(message) {
+  const normalized = `${message || ""}`.toLowerCase();
+  const peopleIntent =
+    /(add|create|hire|bring in|onboard|set up|assign)/.test(normalized) &&
+    /(employee|manager|staff|person|people|team)/.test(normalized);
+  const taskIntent =
+    /(add|create|schedule|assign|put|turn|convert|make|plan|queue)/.test(normalized) &&
+    /(task|tasks|calendar|schedule|shift|checklist|assignment|assignments)/.test(normalized);
+  return peopleIntent || taskIntent;
+}
+
+function extractJsonObject(text) {
+  const normalized = trimText(text);
+  if (!normalized) {
+    return null;
+  }
+
+  const fenced = normalized.match(/```(?:json)?\s*([\s\S]*?)```/i);
+  const candidate = fenced ? trimText(fenced[1]) : normalized;
+  try {
+    return JSON.parse(candidate);
+  } catch {}
+
+  const firstBrace = candidate.indexOf("{");
+  const lastBrace = candidate.lastIndexOf("}");
+  if (firstBrace >= 0 && lastBrace > firstBrace) {
+    try {
+      return JSON.parse(candidate.slice(firstBrace, lastBrace + 1));
+    } catch {}
+  }
+  return null;
+}
+
+function normalizePlannedRole(value) {
+  const normalized = trimText(value).toLowerCase();
+  if (!normalized) {
+    return "";
+  }
+  if (["manager", "managers", "admin", "ops_manager", "operations_manager"].includes(normalized)) {
+    return "Manager";
+  }
+  if (["employee", "employees", "staff", "staff_member", "team_member"].includes(normalized)) {
+    return "Employee";
+  }
+  return "";
+}
+
+function defaultAccentColorForRole(role) {
+  return `${role || ""}`.trim().toLowerCase() === "manager" ? "#0f766e" : "#1f6feb";
+}
+
+function normalizePlannedPerson(input = {}) {
+  const fullName = trimText(input.full_name || input.fullName);
+  const role = normalizePlannedRole(input.role);
+  if (!fullName || !role) {
+    return null;
+  }
+  return {
+    full_name: fullName,
+    role,
+    phone: trimText(input.phone) || null,
+    email: trimText(input.email).toLowerCase() || null,
+    accent_color: trimText(input.accent_color || input.accentColor, defaultAccentColorForRole(role)),
+    notes: trimText(input.notes) || null,
+    is_active:
+      typeof input.is_active === "boolean"
+        ? input.is_active
+        : typeof input.isActive === "boolean"
+          ? input.isActive
+          : true
+  };
+}
+
+function normalizePlannedTask(input = {}, requestedSummary = "") {
+  const rawTitle = trimText(input.title);
+  if (!rawTitle) {
+    return null;
+  }
+  const propertyLabel =
+    trimText(input.property_label || input.propertyLabel) ||
+    resolvePropertyLabel(requestedSummary) ||
+    "Property TBD";
+  let startAt = trimText(input.start_at || input.startAt);
+  let endAt = trimText(input.end_at || input.endAt);
+  if (!startAt || Number.isNaN(Date.parse(startAt)) || !endAt || Number.isNaN(Date.parse(endAt))) {
+    const fallbackSchedule = inferTaskSchedule(`${requestedSummary} ${rawTitle}`);
+    startAt = fallbackSchedule.startAt;
+    endAt = fallbackSchedule.endAt;
+  }
+  const taskType = trimText(input.task_type || input.taskType, parseTaskType(`${rawTitle} ${requestedSummary}`));
+  const priority = trimText(
+    input.priority,
+    `${requestedSummary}`.toLowerCase().includes("urgent")
+      ? "urgent"
+      : `${requestedSummary}`.toLowerCase().includes("high")
+        ? "high"
+        : "normal"
+  );
+  const assigneeNames = Array.isArray(input.assignee_names || input.assigneeNames)
+    ? Array.from(new Set((input.assignee_names || input.assigneeNames).map((entry) => trimText(entry)).filter(Boolean)))
+    : [];
+  const assigneeEmails = Array.isArray(input.assignee_emails || input.assigneeEmails)
+    ? Array.from(
+        new Set(
+          (input.assignee_emails || input.assigneeEmails)
+            .map((entry) => trimText(entry).toLowerCase())
+            .filter(Boolean)
+        )
+      )
+    : [];
+
+  return {
+    title: rawTitle,
+    notes: trimText(input.notes || requestedSummary) || null,
+    task_type: taskType,
+    status: "scheduled",
+    priority,
+    property_label: propertyLabel,
+    start_at: new Date(startAt).toISOString(),
+    end_at: new Date(endAt).toISOString(),
+    reservation_uuid: trimText(input.reservation_uuid || input.reservationUUID) || null,
+    assignee_ids: Array.isArray(input.assignee_ids || input.assigneeIDs)
+      ? Array.from(new Set((input.assignee_ids || input.assigneeIDs).filter(Boolean)))
+      : [],
+    assignee_names: assigneeNames,
+    assignee_emails: assigneeEmails
+  };
+}
+
+function normalizeGaelPlan(rawPlan = {}, requestedSummary = "") {
+  if (!rawPlan || typeof rawPlan !== "object" || Array.isArray(rawPlan)) {
+    return null;
+  }
+  const people = Array.isArray(rawPlan.people)
+    ? rawPlan.people.map((entry) => normalizePlannedPerson(entry)).filter(Boolean)
+    : [];
+  const tasks = Array.isArray(rawPlan.tasks)
+    ? rawPlan.tasks.map((entry) => normalizePlannedTask(entry, requestedSummary)).filter(Boolean)
+    : [];
+  const reply = trimText(rawPlan.reply);
+  const needsFollowUp = Boolean(rawPlan.needs_follow_up || rawPlan.needsFollowUp);
+  const followUpQuestions = Array.isArray(rawPlan.follow_up_questions || rawPlan.followUpQuestions)
+    ? (rawPlan.follow_up_questions || rawPlan.followUpQuestions)
+        .map((entry) => trimText(entry))
+        .filter(Boolean)
+    : [];
+  return {
+    reply,
+    people,
+    tasks,
+    needsFollowUp,
+    followUpQuestions
+  };
+}
+
+function buildGaelPlanSummary(plan) {
+  const peopleCount = Array.isArray(plan.people) ? plan.people.length : 0;
+  const taskCount = Array.isArray(plan.tasks) ? plan.tasks.length : 0;
+  const parts = [];
+  if (peopleCount) {
+    parts.push(`add ${peopleCount} ${peopleCount === 1 ? "person" : "people"}`);
+  }
+  if (taskCount) {
+    parts.push(`schedule ${taskCount} ${taskCount === 1 ? "task" : "tasks"}`);
+  }
+  return parts.join(" and ");
+}
+
+function hasGaelPlanChanges(plan = {}) {
+  return Boolean((Array.isArray(plan.people) && plan.people.length) || (Array.isArray(plan.tasks) && plan.tasks.length));
+}
+
+function buildGaelPlanAction(plan, threadId, actor = {}) {
+  const summary = buildGaelPlanSummary(plan);
+  return {
+    id: randomUUID(),
+    thread_id: threadId,
+    action_type: "ops.plan.apply",
+    target_system: "ops",
+    status: "pending_approval",
+    summary: summary ? `Apply Gael plan: ${summary}` : "Apply Gael operations plan",
+    command_payload: {
+      requested_summary: trimText(plan.requestedSummary),
+      people: plan.people,
+      tasks: plan.tasks
+    },
+    created_by: actor.userId || null
+  };
+}
+
+function normalizePersonMatchKey(value) {
+  return trimText(value).toLowerCase();
+}
+
 export class StaffOperationsService {
   constructor(options = {}) {
     this.controlPlaneService = options.controlPlaneService || null;
@@ -530,17 +742,86 @@ export class StaffOperationsService {
     return response.rows;
   }
 
+  async listPeopleForAssignment(options = {}) {
+    if (!options.skipReadyCheck) {
+      await this.ensureReady();
+    }
+    const opsSchema = quoteIdentifier(this.opsSchema);
+    const response = await this.client.query(
+      `
+        SELECT
+          id,
+          full_name,
+          email,
+          role,
+          is_active
+        FROM ${opsSchema}.people
+        ORDER BY is_active DESC, full_name ASC
+      `
+    );
+    return response.rows;
+  }
+
+  resolveAssigneeIds(taskInput = {}, people = []) {
+    const explicitIds = Array.isArray(taskInput.assignee_ids || taskInput.assigneeIDs)
+      ? Array.from(new Set((taskInput.assignee_ids || taskInput.assigneeIDs).filter(Boolean)))
+      : [];
+    if (explicitIds.length) {
+      return explicitIds;
+    }
+
+    const availablePeople = Array.isArray(people) ? people : [];
+    const byName = new Map();
+    const byEmail = new Map();
+    for (const person of availablePeople) {
+      const nameKey = normalizePersonMatchKey(person.full_name || person.fullName);
+      const emailKey = normalizePersonMatchKey(person.email);
+      if (nameKey && !byName.has(nameKey)) {
+        byName.set(nameKey, person.id);
+      }
+      if (emailKey && !byEmail.has(emailKey)) {
+        byEmail.set(emailKey, person.id);
+      }
+    }
+
+    const nameIds = Array.isArray(taskInput.assignee_names || taskInput.assigneeNames)
+      ? (taskInput.assignee_names || taskInput.assigneeNames)
+          .map((value) => byName.get(normalizePersonMatchKey(value)))
+          .filter(Boolean)
+      : [];
+    const emailIds = Array.isArray(taskInput.assignee_emails || taskInput.assigneeEmails)
+      ? (taskInput.assignee_emails || taskInput.assigneeEmails)
+          .map((value) => byEmail.get(normalizePersonMatchKey(value)))
+          .filter(Boolean)
+      : [];
+    return Array.from(new Set([...nameIds, ...emailIds]));
+  }
+
   async createPerson(input = {}, actor = {}) {
     await this.ensureReady();
-    const resolvedActor = buildActor(actor);
+    await this.client.query("BEGIN");
+    try {
+      const person = await this._createPersonWithinTransaction(input, actor, {
+        source: actor.source || "user"
+      });
+      await this.client.query("COMMIT");
+      return person;
+    } catch (error) {
+      await this.client.query("ROLLBACK");
+      throw error;
+    }
+  }
+
+  async _createPersonWithinTransaction(input = {}, actor = {}, options = {}) {
+    const resolvedActor = buildActor(actor, options.source || "user");
     const fullName = trimText(input.full_name || input.fullName);
     const role = trimText(input.role);
     const phone = trimText(input.phone) || null;
-    const email = trimText(input.email) || null;
+    const email = trimText(input.email).toLowerCase() || null;
     const notes = trimText(input.notes) || null;
     const accentColor = trimText(
       input.accent_color || input.accentColor,
-      role.toLowerCase() === "manager" ? "#0f766e" : "#1f6feb"
+      defaultAccentColorForRole(role)
     );
     const isActive =
       typeof input.is_active === "boolean"
@@ -554,33 +835,10 @@ export class StaffOperationsService {
     }
 
     const opsSchema = quoteIdentifier(this.opsSchema);
-    await this.client.query("BEGIN");
-    try {
-      const response = await this.client.query(
-        `
-          INSERT INTO ${opsSchema}.people
-            (
-              id,
-              full_name,
-              role,
-              phone,
-              email,
-              accent_color,
-              notes,
-              is_active
-            )
-          VALUES
-            (
-              $1::uuid,
-              $2,
-              $3,
-              $4,
-              $5,
-              $6,
-              $7,
-              $8::boolean
-            )
-          RETURNING
+    const response = await this.client.query(
+      `
+        INSERT INTO ${opsSchema}.people
+          (
             id,
             full_name,
             role,
@@ -589,40 +847,57 @@ export class StaffOperationsService {
             accent_color,
             notes,
             is_active
-        `,
-        [randomUUID(), fullName, role, phone, email, accentColor, notes, isActive]
-      );
-      const person = response.rows[0];
+          )
+        VALUES
+          (
+            $1::uuid,
+            $2,
+            $3,
+            $4,
+            $5,
+            $6,
+            $7,
+            $8::boolean
+          )
+        RETURNING
+          id,
+          full_name,
+          role,
+          phone,
+          email,
+          accent_color,
+          notes,
+          is_active
+      `,
+      [randomUUID(), fullName, role, phone, email, accentColor, notes, isActive]
+    );
+    const person = response.rows[0];
 
-      await this.recordAuditLog(
-        {
-          actor: resolvedActor,
-          eventType: "person.created",
-          entityType: "person",
-          entityId: person.id,
-          details: {
-            role: person.role,
-            is_active: person.is_active
-          }
-        },
-        { skipReadyCheck: true }
-      );
-      await this.emitChangeEvent(
-        {
-          type: "person.created",
-          changedDomains: ["people"],
-          payload: {
-            person_id: person.id
-          }
-        },
-        { skipReadyCheck: true }
-      );
-      await this.client.query("COMMIT");
-      return person;
-    } catch (error) {
-      await this.client.query("ROLLBACK");
-      throw error;
-    }
+    await this.recordAuditLog(
+      {
+        actor: resolvedActor,
+        eventType: "person.created",
+        entityType: "person",
+        entityId: person.id,
+        details: {
+          role: person.role,
+          is_active: person.is_active
+        }
+      },
+      { skipReadyCheck: true }
+    );
+    await this.emitChangeEvent(
+      {
+        type: "person.created",
+        changedDomains: ["people"],
+        payload: {
+          person_id: person.id
+        }
+      },
+      { skipReadyCheck: true }
+    );
+
+    return person;
   }
 
   async createTask(input = {}, actor = {}) {
@@ -1033,6 +1308,167 @@ export class StaffOperationsService {
             resolvedActor.email || null,
             `agent-task-${actionId}`,
             JSON.stringify(action.command_payload || {}),
+            JSON.stringify(executionResult)
+          ]
+        );
+
+        const updatedActionResponse = await this.client.query(
+          `
+            UPDATE ${opsSchema}.agent_actions
+            SET
+              status = 'succeeded',
+              result_payload = $2::jsonb,
+              confirmed_by = $3::uuid,
+              confirmed_by_email = $4,
+              confirmed_at = NOW(),
+              updated_at = NOW()
+            WHERE id = $1::uuid
+            RETURNING
+              id,
+              thread_id,
+              action_type,
+              target_system,
+              status,
+              summary,
+              command_payload,
+              result_payload,
+              created_at,
+              updated_at
+          `,
+          [
+            actionId,
+            JSON.stringify(executionResult),
+            resolvedActor.userId,
+            resolvedActor.email || null
+          ]
+        );
+        finalAction = normalizeActionRow(updatedActionResponse.rows[0]);
+      } else if (action.action_type === "ops.plan.apply") {
+        await this.client.query(
+          `
+            UPDATE ${opsSchema}.agent_actions
+            SET
+              status = 'executing',
+              confirmed_by = $2::uuid,
+              confirmed_by_email = $3,
+              confirmed_at = NOW(),
+              updated_at = NOW()
+            WHERE id = $1::uuid
+          `,
+          [actionId, resolvedActor.userId, resolvedActor.email || null]
+        );
+
+        const payload = action.command_payload || {};
+        const plannedPeople = Array.isArray(payload.people) ? payload.people : [];
+        const plannedTasks = Array.isArray(payload.tasks) ? payload.tasks : [];
+        if (!plannedPeople.length && !plannedTasks.length) {
+          throw new Error("agent_plan_empty");
+        }
+
+        const existingPeople = await this.listPeopleForAssignment({ skipReadyCheck: true });
+        const matchedPeople = [];
+        const createdPeople = [];
+        const availablePeople = existingPeople.slice();
+
+        for (const personInput of plannedPeople) {
+          const fullNameKey = normalizePersonMatchKey(personInput.full_name || personInput.fullName);
+          const emailKey = normalizePersonMatchKey(personInput.email);
+          const existingMatch = availablePeople.find((person) => {
+            const personNameKey = normalizePersonMatchKey(person.full_name || person.fullName);
+            const personEmailKey = normalizePersonMatchKey(person.email);
+            return (
+              (emailKey && personEmailKey && emailKey === personEmailKey) ||
+              (fullNameKey && personNameKey && fullNameKey === personNameKey)
+            );
+          });
+          if (existingMatch) {
+            matchedPeople.push(existingMatch);
+            continue;
+          }
+          const createdPerson = await this._createPersonWithinTransaction(personInput, resolvedActor, {
+            source: "agent"
+          });
+          createdPeople.push(createdPerson);
+          availablePeople.push(createdPerson);
+        }
+
+        const createdTasks = [];
+        for (const taskInput of plannedTasks) {
+          const resolvedAssigneeIds = this.resolveAssigneeIds(taskInput, availablePeople);
+          const createdTask = await this._createTaskWithinTransaction(
+            {
+              ...taskInput,
+              assignee_ids: resolvedAssigneeIds
+            },
+            resolvedActor,
+            {
+              source: "agent"
+            }
+          );
+          createdTasks.push(createdTask);
+        }
+
+        const executionResult = {
+          status: "succeeded",
+          people_created: createdPeople.map((person) => ({
+            id: person.id,
+            full_name: person.full_name,
+            role: person.role
+          })),
+          people_matched_existing: matchedPeople.map((person) => ({
+            id: person.id,
+            full_name: person.full_name,
+            role: person.role
+          })),
+          tasks_created: createdTasks.map((task) => ({
+            id: task.id,
+            title: task.title,
+            property_label: task.property_label,
+            start_at: task.start_at,
+            end_at: task.end_at
+          }))
+        };
+
+        await this.client.query(
+          `
+            INSERT INTO ${opsSchema}.command_executions
+              (
+                id,
+                action_id,
+                actor_user_id,
+                actor_email,
+                source,
+                target_system,
+                idempotency_key,
+                request_payload,
+                result_payload,
+                status,
+                created_at,
+                finished_at
+              )
+            VALUES
+              (
+                $1::uuid,
+                $2::uuid,
+                $3::uuid,
+                $4,
+                'agent',
+                'ops',
+                $5,
+                $6::jsonb,
+                $7::jsonb,
+                'succeeded',
+                NOW(),
+                NOW()
+              )
+          `,
+          [
+            randomUUID(),
+            actionId,
+            resolvedActor.userId,
+            resolvedActor.email || null,
+            `agent-plan-${actionId}`,
+            JSON.stringify(payload),
             JSON.stringify(executionResult)
           ]
         );
@@ -1508,7 +1944,7 @@ export class StaffOperationsService {
       interactionMode === "voice_call"
         ? "Keep the response brief and natural for spoken playback. "
         : "";
-    const taskDraft = buildAgentTaskDraft(message);
+    const taskDraft = resolvedAgentId === "gael" ? null : buildAgentTaskDraft(message);
     if (taskDraft) {
       const startLabel = new Date(taskDraft.start_at).toLocaleString("en-US", {
         dateStyle: "medium",
@@ -1604,18 +2040,123 @@ export class StaffOperationsService {
         ? recentMessages
         : [{ role: "user", content: trimText(message) }];
       let dashboardSummary = "Live dashboard summary is currently unavailable.";
+      let peopleDirectorySummary = "Current active staff directory is unavailable.";
+      let dashboard = null;
       if (this.client) {
-        const dashboard = await this.getDashboard({
+        dashboard = await this.getDashboard({
           from: startOfDay().toISOString(),
           to: addDays(startOfDay(), DEFAULT_STREAM_WINDOW_DAYS).toISOString()
         });
         dashboardSummary = `Live dashboard summary: ${dashboard.reservations.length} reservations in window, ${dashboard.tasks.length} scheduled tasks, ${dashboard.people.filter((person) => person.is_active).length} active staff, ${dashboard.assignments.length} assignments.`;
+        const activePeopleSummary = dashboard.people
+          .filter((person) => person.is_active)
+          .slice(0, 25)
+          .map((person) => `${person.full_name} (${person.role})`)
+          .join(", ");
+        peopleDirectorySummary = activePeopleSummary
+          ? `Current active staff directory: ${activePeopleSummary}.`
+          : "Current active staff directory has no active people.";
       }
+
+      const shouldAttemptPlanning = looksLikeGaelPlanningRequest(message) || interactionMode !== "voice_call";
+      if (shouldAttemptPlanning) {
+        const planningSystem = [
+          "You are Gael, a manager-only Claude-powered estate systems agent for Exuma Turquoise Resorts.",
+          "First decide whether the manager is asking you to change operations state.",
+          "If the request implies creating people, staffing, assignments, shifts, tasks, schedules, plans, or turning an idea into work, return a structured execution plan.",
+          "If the request is only advisory, return empty people and tasks arrays.",
+          "Return JSON only. Do not wrap the response in markdown.",
+          'Schema: {"reply":string,"needs_follow_up":boolean,"follow_up_questions":string[],"people":[{"full_name":string,"role":"Manager"|"Employee","phone":string|null,"email":string|null,"notes":string|null,"is_active":boolean}],"tasks":[{"title":string,"notes":string|null,"task_type":string,"priority":string,"property_label":string,"start_at":string,"end_at":string,"assignee_names":string[],"assignee_emails":string[]}]}',
+          "Use ISO-8601 timestamps.",
+          "Today is 2026-04-09 in America/New_York.",
+          "If the manager says today or tomorrow and no time is given, default to 09:00 local with a one hour duration.",
+          "Allowed people roles are Manager and Employee only.",
+          "Known property labels include KL Cottage, Lake Cottage, Villa Esencia, and Property TBD.",
+          "If critical details are missing for an execution request, set needs_follow_up to true and ask concise follow-up questions instead of inventing unsafe details.",
+          dashboardSummary,
+          peopleDirectorySummary,
+          `Current staff user: ${actor.email || actor.userId || "unknown"}`
+        ].join(" ");
+
+        const planningResponse = await this.gaelService.sendConversation({
+          system: planningSystem,
+          messages: anthropicMessages,
+          maxOutputTokens: interactionMode === "voice_call" ? 320 : 700,
+          temperature: 0.1
+        });
+        const parsedPlan = normalizeGaelPlan(extractJsonObject(planningResponse.reply), message);
+        if (parsedPlan) {
+          const summary = buildGaelPlanSummary(parsedPlan);
+          if (hasGaelPlanChanges(parsedPlan) && !parsedPlan.needsFollowUp) {
+            return {
+              reply:
+                normalizeGaelReply(trimText(parsedPlan.reply) || `Prepared plan to ${summary}. Confirm to apply.`) ||
+                `- Prepared plan to ${summary}.\n- Confirm to apply.`,
+              pendingActions: [
+                buildGaelPlanAction(
+                  {
+                    ...parsedPlan,
+                    requestedSummary: message
+                  },
+                  threadId,
+                  actor
+                )
+              ],
+              metadata: {
+                gael_connected: true,
+                gael_model: trimText(planningResponse.model),
+                gael_stop_reason: trimText(planningResponse.stop_reason),
+                gael_usage: planningResponse.usage || {},
+                gael_plan_detected: true
+              }
+            };
+          }
+
+          if (parsedPlan.needsFollowUp) {
+            const followUpReply =
+              normalizeGaelReply(trimText(parsedPlan.reply)) ||
+              parsedPlan.followUpQuestions.map((question) => `- ${question}`).join("\n") ||
+              normalizeGaelReply(planningResponse.reply) ||
+              "- Need more detail before I can prepare an executable plan.";
+            return {
+              reply: followUpReply,
+              pendingActions: [],
+              metadata: {
+                gael_connected: true,
+                gael_model: trimText(planningResponse.model),
+                gael_stop_reason: trimText(planningResponse.stop_reason),
+                gael_usage: planningResponse.usage || {},
+                gael_plan_detected: true,
+                gael_needs_follow_up: true
+              }
+            };
+          }
+        }
+
+        const planningFallbackReply = normalizeGaelReply(planningResponse.reply);
+        if (planningFallbackReply) {
+          return {
+            reply: planningFallbackReply,
+            pendingActions: [],
+            metadata: {
+              gael_connected: true,
+              gael_model: trimText(planningResponse.model),
+              gael_stop_reason: trimText(planningResponse.stop_reason),
+              gael_usage: planningResponse.usage || {},
+              gael_plan_parse_failed: true
+            }
+          };
+        }
+      }
+
       const systemContext = [
         "You are Gael, a manager-only Claude-powered estate systems agent for Exuma Turquoise Resorts.",
         "Focus on operations strategy, workflow design, staffing coordination, automation ideas, implementation planning, and crisp decision support.",
         "Be direct, skeptical, and neutral. Do not be upbeat, congratulatory, or motivational.",
         "Keep responses short.",
+        "Start directly with the list. No preamble.",
+        "Maximum 3 items.",
+        "Maximum 14 words per item.",
         "Output plain text only.",
         "Use only numbered lists or hyphen bullet lists.",
         "Do not use markdown emphasis, asterisks, headings, emojis, or decorative formatting.",
