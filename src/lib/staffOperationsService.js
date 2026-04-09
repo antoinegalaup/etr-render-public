@@ -2039,6 +2039,8 @@ export class StaffOperationsService {
       const anthropicMessages = recentMessages.length
         ? recentMessages
         : [{ role: "user", content: trimText(message) }];
+      const lowerMessage = `${message || ""}`.toLowerCase();
+      const mentionsPeopleRequest = /(employee|manager|staff|person|people|team)/.test(lowerMessage);
       let dashboardSummary = "Live dashboard summary is currently unavailable.";
       let peopleDirectorySummary = "Current active staff directory is unavailable.";
       let dashboard = null;
@@ -2134,6 +2136,47 @@ export class StaffOperationsService {
         }
 
         const planningFallbackReply = normalizeGaelReply(planningResponse.reply);
+        const heuristicTaskDraft = buildAgentTaskDraft(message);
+        if (heuristicTaskDraft) {
+          return {
+            reply: mentionsPeopleRequest
+              ? "- Prepared the task plan.\n- Confirm to apply.\n- Send staff names if you want people added too."
+              : "- Prepared the task plan.\n- Confirm to apply.",
+            pendingActions: [
+              buildGaelPlanAction(
+                {
+                  requestedSummary: message,
+                  people: [],
+                  tasks: [heuristicTaskDraft]
+                },
+                threadId,
+                actor
+              )
+            ],
+            metadata: {
+              gael_connected: true,
+              gael_model: trimText(planningResponse.model),
+              gael_stop_reason: trimText(planningResponse.stop_reason),
+              gael_usage: planningResponse.usage || {},
+              gael_plan_parse_failed: true,
+              gael_heuristic_plan: true
+            }
+          };
+        }
+        if (mentionsPeopleRequest && looksLikeGaelPlanningRequest(message)) {
+          return {
+            reply: "- I need staff names before I can add people.\n- I can still schedule the task once details are clear.",
+            pendingActions: [],
+            metadata: {
+              gael_connected: true,
+              gael_model: trimText(planningResponse.model),
+              gael_stop_reason: trimText(planningResponse.stop_reason),
+              gael_usage: planningResponse.usage || {},
+              gael_plan_parse_failed: true,
+              gael_needs_follow_up: true
+            }
+          };
+        }
         if (planningFallbackReply) {
           return {
             reply: planningFallbackReply,
