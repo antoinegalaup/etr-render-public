@@ -12,6 +12,8 @@ import { getPublicPropertyCards, getPublicPropertyDetail } from "./lib/publicSit
 import { createEtrGuestChatService } from "./lib/etrGuestChatService.js";
 import { StaffAuthService } from "./lib/staffAuthService.js";
 import { StaffOperationsService } from "./lib/staffOperationsService.js";
+import { VincentService } from "./lib/vincentService.js";
+import { AnthropicAgentService } from "./lib/anthropicAgentService.js";
 import { registerStaffRoutes } from "./routes/staffRoutes.js";
 
 function readManifest(filePath) {
@@ -217,6 +219,10 @@ export function createApp({
   let publicGuestChatService = guestChatService;
   let internalStaffAuthService = staffAuthService;
   let internalStaffOperationsService = staffOperationsService;
+  const vincentService = new VincentService({
+    internalApiSecret
+  });
+  const gaelService = new AnthropicAgentService();
   if (!ingestService && syncDatabaseUrl) {
     ingestService = new ControlPlaneService({
       databaseUrl: syncDatabaseUrl,
@@ -236,6 +242,8 @@ export function createApp({
   if (!internalStaffOperationsService && ingestService?.connect) {
     internalStaffOperationsService = new StaffOperationsService({
       controlPlaneService: ingestService,
+      vincentService,
+      gaelService,
       syncSchema,
       opsSchema: "ops"
     });

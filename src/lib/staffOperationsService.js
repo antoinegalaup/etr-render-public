@@ -147,6 +147,9 @@ function normalizeAgentId(value) {
   const normalized = trimText(value, "vincent")
     .toLowerCase()
     .replace(/[\s-]+/g, "_");
+  if (["gael", "claude", "claude_code"].includes(normalized)) {
+    return "gael";
+  }
   if (["customer_service", "guest_service", "support"].includes(normalized)) {
     return "customer_service";
   }
@@ -281,6 +284,8 @@ function buildAgentTaskDraft(message) {
 export class StaffOperationsService {
   constructor(options = {}) {
     this.controlPlaneService = options.controlPlaneService || null;
+    this.vincentService = options.vincentService || null;
+    this.gaelService = options.gaelService || null;
     this.syncSchema = validateIdentifier(options.syncSchema || "sync", "sync_schema");
     this.opsSchema = validateIdentifier(options.opsSchema || "ops", "ops_schema");
   }
@@ -296,6 +301,34 @@ export class StaffOperationsService {
 
   get client() {
     return this.controlPlaneService?._client;
+  }
+
+  async loadRecentThreadMessages(threadId, limit = 10) {
+    if (!this.client || !threadId) {
+      return [];
+    }
+
+    const opsSchema = quoteIdentifier(this.opsSchema);
+    const response = await this.client.query(
+      `
+        SELECT role, content
+        FROM ${opsSchema}.agent_messages
+        WHERE thread_id = $1::uuid
+          AND role IN ('user', 'assistant')
+        ORDER BY created_at DESC
+        LIMIT $2
+      `,
+      [threadId, limit]
+    );
+
+    return response.rows
+      .slice()
+      .reverse()
+      .map((row) => ({
+        role: row.role === "assistant" ? "assistant" : "user",
+        content: trimText(row.content)
+      }))
+      .filter((row) => row.content);
   }
 
   async getDashboard({ from, to }) {
@@ -687,6 +720,7 @@ export class StaffOperationsService {
 
     await this.client.query("BEGIN");
     let userMessageRow;
+    let persistedVincentSessionId = "";
     try {
       const threadResponse = await this.client.query(
         `
@@ -701,6 +735,20 @@ export class StaffOperationsService {
         throw new Error("agent_thread_not_found");
       }
       assertAgentThreadAccess(threadResponse.rows[0], resolvedActor);
+      const latestAssistantMessageResponse = await this.client.query(
+        `
+          SELECT metadata
+          FROM ${opsSchema}.agent_messages
+          WHERE thread_id = $1::uuid
+            AND role = 'assistant'
+          ORDER BY created_at DESC
+          LIMIT 1
+        `,
+        [threadId]
+      );
+      persistedVincentSessionId = trimText(
+        latestAssistantMessageResponse.rows[0]?.metadata?.vincent_session_id || ""
+      );
       const insertedUserMessage = await this.client.query(
         `
           INSERT INTO ${opsSchema}.agent_messages
@@ -737,7 +785,10 @@ export class StaffOperationsService {
     const outcome = await this.buildAgentOutcome(message, threadId, resolvedActor, agentId, {
       interactionMode,
       transcript,
-      attachments
+      attachments,
+      vincentSessionId:
+        trimText(input.vincent_session_id || input.vincentSessionId || "") ||
+        persistedVincentSessionId
     });
 
     await this.client.query("BEGIN");
@@ -758,7 +809,8 @@ export class StaffOperationsService {
           JSON.stringify({
             pending_action_ids: outcome.pendingActions.map((action) => action.id),
             agent_id: agentId,
-            interaction_mode: interactionMode
+            interaction_mode: interactionMode,
+            ...(outcome.metadata || {})
           })
         ]
       );
@@ -1421,6 +1473,111 @@ export class StaffOperationsService {
             created_by: actor.userId || null
           }
         ]
+      };
+    }
+
+    if (resolvedAgentId === "vincent") {
+      if (!this.vincentService?.isConfigured?.()) {
+        return {
+          reply: `${conciseLead}Vincent is not connected yet. The knowledge service is not configured on this backend.`,
+          pendingActions: [],
+          metadata: {
+            vincent_connected: false
+          }
+        };
+      }
+
+      let vincentSessionId = trimText(context.vincentSessionId);
+      if (!vincentSessionId) {
+        const createdSession = await this.vincentService.createSession({
+          purpose: `staff thread ${threadId} for ${actor.email || actor.userId || "unknown_staff"}`
+        });
+        vincentSessionId = trimText(createdSession.session_id);
+      }
+
+      const vincentResponse = await this.vincentService.sendMessage(vincentSessionId, {
+        message,
+        maxOutputTokens: interactionMode === "voice_call" ? 300 : 700
+      });
+
+      return {
+        reply:
+          trimText(vincentResponse.reply) ||
+          `${conciseLead}Vincent did not return a reply.`,
+        pendingActions: [],
+        metadata: {
+          vincent_connected: true,
+          vincent_session_id: vincentSessionId,
+          vincent_citations: Array.isArray(vincentResponse.citations)
+            ? vincentResponse.citations
+            : [],
+          vincent_website_paths: Array.isArray(vincentResponse.website_paths_considered)
+            ? vincentResponse.website_paths_considered
+            : [],
+          vincent_recommended_actions: Array.isArray(vincentResponse.recommended_actions)
+            ? vincentResponse.recommended_actions
+            : [],
+          vincent_needs_follow_up: Boolean(vincentResponse.needs_follow_up),
+          vincent_tools_used: Array.isArray(vincentResponse.tools_used)
+            ? vincentResponse.tools_used
+            : [],
+          vincent_model: trimText(vincentResponse.model)
+        }
+      };
+    }
+
+    if (resolvedAgentId === "gael") {
+      if (!actor?.isElevatedStaff) {
+        return {
+          reply: `${conciseLead}Gael is reserved for managers right now. Employees can continue using Vincent for estate knowledge and live operations.`,
+          pendingActions: []
+        };
+      }
+
+      if (!this.gaelService?.isConfigured?.()) {
+        return {
+          reply: `${conciseLead}Gael is not connected yet. Add an Anthropic API key to enable the Claude-backed systems agent.`,
+          pendingActions: [],
+          metadata: {
+            gael_connected: false
+          }
+        };
+      }
+
+      const recentMessages = await this.loadRecentThreadMessages(threadId);
+      const anthropicMessages = recentMessages.length
+        ? recentMessages
+        : [{ role: "user", content: trimText(message) }];
+      let dashboardSummary = "Live dashboard summary is currently unavailable.";
+      if (this.client) {
+        const dashboard = await this.getDashboard({
+          from: startOfDay().toISOString(),
+          to: addDays(startOfDay(), DEFAULT_STREAM_WINDOW_DAYS).toISOString()
+        });
+        dashboardSummary = `Live dashboard summary: ${dashboard.reservations.length} reservations in window, ${dashboard.tasks.length} scheduled tasks, ${dashboard.people.filter((person) => person.is_active).length} active staff, ${dashboard.assignments.length} assignments.`;
+      }
+      const systemContext = [
+        "You are Gael, a manager-only Claude-powered estate systems agent for Exuma Turquoise Resorts.",
+        "Focus on operations strategy, workflow design, staffing coordination, automation ideas, implementation planning, and crisp decision support.",
+        "Do not claim an action was executed unless the system explicitly tells you it was completed.",
+        dashboardSummary,
+        `Current staff user: ${actor.email || actor.userId || "unknown"}`
+      ].join(" ");
+      const gaelResponse = await this.gaelService.sendConversation({
+        system: systemContext,
+        messages: anthropicMessages,
+        maxOutputTokens: interactionMode === "voice_call" ? 300 : 700
+      });
+
+      return {
+        reply: trimText(gaelResponse.reply) || `${conciseLead}Gael did not return a reply.`,
+        pendingActions: [],
+        metadata: {
+          gael_connected: true,
+          gael_model: trimText(gaelResponse.model),
+          gael_stop_reason: trimText(gaelResponse.stop_reason),
+          gael_usage: gaelResponse.usage || {}
+        }
       };
     }
 

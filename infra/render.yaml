@@ -60,6 +60,16 @@ services:
         sync: false
       - key: OPENAI_API_KEY
         sync: false
+      - key: ANTHROPIC_API_KEY
+        sync: false
+      - key: ANTHROPIC_MODEL
+        value: claude-sonnet-4-20250514
+      - key: VINCENT_API_BASE_URL
+        sync: false
+      - key: VINCENT_API_SECRET
+        sync: false
+      - key: VINCENT_API_TIMEOUT_MS
+        value: "30000"
       - key: STRIPE_SECRET_KEY
         sync: false
       - key: STRIPE_WEBHOOK_SECRET
