@@ -30,6 +30,12 @@ services:
         sync: false
       - key: STAFF_AUTH_RELAXED
         value: "false"
+      - key: STAFF_AUTH_RATE_LIMIT_ENABLED
+        value: "true"
+      - key: STAFF_AUTH_RATE_LIMIT_WINDOW_MS
+        value: "60000"
+      - key: STAFF_AUTH_RATE_LIMIT_MAX
+        value: "8"
       - key: EXPOSE_ARCHITECTURE_ROUTES
         value: "false"
       - key: PUBLIC_RATE_LIMIT_ENABLED

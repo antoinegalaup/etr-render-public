@@ -8,10 +8,13 @@ function readBearerToken(req) {
 }
 
 function buildActor(user = {}) {
+  const staffRole = normalizedStaffRole(user);
   return {
     userId: user.id || null,
     email: user.email || "",
-    source: "user"
+    source: "user",
+    staffRole,
+    isElevatedStaff: Boolean(staffRole && staffRole !== "employee")
   };
 }
 
@@ -27,7 +30,11 @@ function assertWriteAccess(user = {}) {
 
 function errorStatus(error) {
   const message = `${error?.message || error || ""}`;
-  if (message.includes("write_access_denied")) {
+  if (
+    message.includes("write_access_denied") ||
+    message.includes("thread_access_denied") ||
+    message.includes("action_access_denied")
+  ) {
     return 403;
   }
   if (
@@ -49,14 +56,70 @@ function errorStatus(error) {
   return 500;
 }
 
-export function registerStaffRoutes(app, { staffAuthService, staffOperationsService } = {}) {
+function buildAuthRateLimiter({ enabled = true, windowMs = 60000, maxRequests = 8 } = {}) {
+  const buckets = new Map();
+  let lastSweepAt = 0;
+
+  function clientKeyFor(req) {
+    const ip =
+      `${req.ip || ""}`.trim() ||
+      `${req.socket?.remoteAddress || ""}`.trim() ||
+      "unknown";
+    const email = `${req.body?.email || ""}`.trim().toLowerCase();
+    return email ? `${ip}:${email}` : ip;
+  }
+
+  return function authRateLimiter(req, res, next) {
+    if (!enabled) {
+      return next();
+    }
+
+    const now = Date.now();
+    if (now - lastSweepAt >= windowMs) {
+      for (const [bucketKey, bucket] of buckets.entries()) {
+        if (!bucket || bucket.resetAt <= now) {
+          buckets.delete(bucketKey);
+        }
+      }
+      lastSweepAt = now;
+    }
+
+    const key = clientKeyFor(req);
+    const current = buckets.get(key);
+    const bucket =
+      current && current.resetAt > now
+        ? current
+        : { count: 0, resetAt: now + windowMs };
+
+    bucket.count += 1;
+    buckets.set(key, bucket);
+
+    res.setHeader("X-RateLimit-Limit", `${maxRequests}`);
+    res.setHeader("X-RateLimit-Remaining", `${Math.max(0, maxRequests - bucket.count)}`);
+    res.setHeader("X-RateLimit-Reset", `${Math.ceil(bucket.resetAt / 1000)}`);
+
+    if (bucket.count > maxRequests) {
+      const retryAfterSeconds = Math.max(1, Math.ceil((bucket.resetAt - now) / 1000));
+      res.setHeader("Retry-After", `${retryAfterSeconds}`);
+      return res.status(429).json({ error: "staff_auth_rate_limit_exceeded" });
+    }
+
+    return next();
+  };
+}
+
+export function registerStaffRoutes(
+  app,
+  { staffAuthService, staffOperationsService, authRateLimit = {} } = {}
+) {
   if (!staffAuthService || !staffOperationsService) {
     return;
   }
 
   const router = express.Router();
+  const authRateLimiter = buildAuthRateLimiter(authRateLimit);
 
-  router.post("/session", async (req, res) => {
+  router.post("/session", authRateLimiter, async (req, res) => {
     try {
       const session = await staffAuthService.signIn({
         email: req.body?.email,
@@ -70,7 +133,7 @@ export function registerStaffRoutes(app, { staffAuthService, staffOperationsServ
     }
   });
 
-  router.post("/session/refresh", async (req, res) => {
+  router.post("/session/refresh", authRateLimiter, async (req, res) => {
     try {
       const session = await staffAuthService.refreshSession({
         refreshToken: req.body?.refresh_token || req.body?.refreshToken

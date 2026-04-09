@@ -74,11 +74,47 @@ function trimText(value, fallback = "") {
 }
 
 function buildActor(actor = {}, fallbackSource = "user") {
+  const staffRole = trimText(actor.staffRole || actor.staff_role).toLowerCase() || null;
   return {
     userId: actor.userId || actor.user_id || null,
     email: trimText(actor.email || actor.user_email),
-    source: trimText(actor.source, fallbackSource)
+    source: trimText(actor.source, fallbackSource),
+    staffRole,
+    isElevatedStaff:
+      typeof actor.isElevatedStaff === "boolean"
+        ? actor.isElevatedStaff
+        : Boolean(staffRole && staffRole !== "employee")
   };
+}
+
+function assertAgentThreadAccess(threadRow = {}, actor = {}) {
+  const resolvedActor = buildActor(actor);
+  if (resolvedActor.isElevatedStaff) {
+    return resolvedActor;
+  }
+  if (
+    resolvedActor.userId &&
+    threadRow.created_by &&
+    `${threadRow.created_by}` === `${resolvedActor.userId}`
+  ) {
+    return resolvedActor;
+  }
+  throw new Error("agent_thread_access_denied");
+}
+
+function assertAgentActionAccess(actionRow = {}, actor = {}) {
+  const resolvedActor = buildActor(actor);
+  if (resolvedActor.isElevatedStaff) {
+    return resolvedActor;
+  }
+  if (
+    resolvedActor.userId &&
+    actionRow.created_by &&
+    `${actionRow.created_by}` === `${resolvedActor.userId}`
+  ) {
+    return resolvedActor;
+  }
+  throw new Error("agent_action_access_denied");
 }
 
 function normalizeActionRow(row = {}) {
@@ -108,11 +144,26 @@ function normalizeMessageRow(row = {}, pendingActions = []) {
 }
 
 function normalizeAgentId(value) {
-  const normalized = trimText(value, "vincent").toLowerCase();
+  const normalized = trimText(value, "vincent")
+    .toLowerCase()
+    .replace(/[\s-]+/g, "_");
+  if (["customer_service", "guest_service", "support"].includes(normalized)) {
+    return "customer_service";
+  }
   if (["vincent", "tessa", "mira"].includes(normalized)) {
     return normalized;
   }
   return "vincent";
+}
+
+function normalizeInteractionMode(value) {
+  const normalized = trimText(value, "text")
+    .toLowerCase()
+    .replace(/[\s-]+/g, "_");
+  if (["voice_note", "voice_call", "text"].includes(normalized)) {
+    return normalized;
+  }
+  return "text";
 }
 
 function normalizeStreamEvent(row = {}) {
@@ -626,7 +677,10 @@ export class StaffOperationsService {
     const opsSchema = quoteIdentifier(this.opsSchema);
     const resolvedActor = buildActor(actor);
     const agentId = normalizeAgentId(input.agent_id || input.agentId);
-    const message = trimText(input.message);
+    const interactionMode = normalizeInteractionMode(input.interaction_mode || input.interactionMode);
+    const attachments = Array.isArray(input.attachments) ? input.attachments : [];
+    const transcript = trimText(input.transcript);
+    const message = trimText(input.message || transcript);
     if (!message) {
       throw new Error("agent_message_required");
     }
@@ -635,12 +689,18 @@ export class StaffOperationsService {
     let userMessageRow;
     try {
       const threadResponse = await this.client.query(
-        `SELECT id FROM ${opsSchema}.agent_threads WHERE id = $1::uuid LIMIT 1`,
+        `
+          SELECT id, created_by
+          FROM ${opsSchema}.agent_threads
+          WHERE id = $1::uuid
+          LIMIT 1
+        `,
         [threadId]
       );
       if (!threadResponse.rows.length) {
         throw new Error("agent_thread_not_found");
       }
+      assertAgentThreadAccess(threadResponse.rows[0], resolvedActor);
       const insertedUserMessage = await this.client.query(
         `
           INSERT INTO ${opsSchema}.agent_messages
@@ -656,7 +716,10 @@ export class StaffOperationsService {
           resolvedActor.userId,
           JSON.stringify({
             user_email: resolvedActor.email || null,
-            agent_id: agentId
+            agent_id: agentId,
+            interaction_mode: interactionMode,
+            transcript: transcript || null,
+            attachments
           })
         ]
       );
@@ -671,7 +734,11 @@ export class StaffOperationsService {
       throw error;
     }
 
-    const outcome = await this.buildAgentOutcome(message, threadId, resolvedActor, agentId);
+    const outcome = await this.buildAgentOutcome(message, threadId, resolvedActor, agentId, {
+      interactionMode,
+      transcript,
+      attachments
+    });
 
     await this.client.query("BEGIN");
     try {
@@ -690,7 +757,8 @@ export class StaffOperationsService {
           outcome.reply,
           JSON.stringify({
             pending_action_ids: outcome.pendingActions.map((action) => action.id),
-            agent_id: agentId
+            agent_id: agentId,
+            interaction_mode: interactionMode
           })
         ]
       );
@@ -791,6 +859,7 @@ export class StaffOperationsService {
             summary,
             command_payload,
             result_payload,
+            created_by,
             created_at,
             updated_at
           FROM ${opsSchema}.agent_actions
@@ -803,6 +872,7 @@ export class StaffOperationsService {
         throw new Error("agent_action_not_found");
       }
       const action = actionResponse.rows[0];
+      assertAgentActionAccess(action, resolvedActor);
       if (action.status !== "pending_approval") {
         throw new Error(`agent_action_invalid_state:${action.status}`);
       }
@@ -1324,8 +1394,13 @@ export class StaffOperationsService {
     );
   }
 
-  async buildAgentOutcome(message, threadId, actor, agentId = "vincent") {
+  async buildAgentOutcome(message, threadId, actor, agentId = "vincent", context = {}) {
     const resolvedAgentId = normalizeAgentId(agentId);
+    const interactionMode = normalizeInteractionMode(context.interactionMode);
+    const conciseLead =
+      interactionMode === "voice_call"
+        ? "Keep the response brief and natural for spoken playback. "
+        : "";
     const taskDraft = buildAgentTaskDraft(message);
     if (taskDraft) {
       const startLabel = new Date(taskDraft.start_at).toLocaleString("en-US", {
@@ -1333,7 +1408,7 @@ export class StaffOperationsService {
         timeStyle: "short"
       });
       return {
-        reply: `I drafted a ${taskDraft.task_type.replace(/_/g, " ")} task for ${taskDraft.property_label} at ${startLabel}. Confirm to execute it.`,
+        reply: `${conciseLead}I drafted a ${taskDraft.task_type.replace(/_/g, " ")} task for ${taskDraft.property_label} at ${startLabel}. Confirm to execute it.`,
         pendingActions: [
           {
             id: randomUUID(),
@@ -1381,20 +1456,28 @@ export class StaffOperationsService {
 
     if (resolvedAgentId === "tessa") {
       return {
-        reply: `Tessa focus: there are ${dashboard.tasks.length} scheduled tasks, ${urgentTasks} urgent task(s), and ${unassignedTasks} unassigned task(s). Active staffing currently shows ${activeManagers} manager(s) and ${activeEmployees} employee(s).`,
+        reply: `${conciseLead}Tessa focus: there are ${dashboard.tasks.length} scheduled tasks, ${urgentTasks} urgent task(s), and ${unassignedTasks} unassigned task(s). Active staffing currently shows ${activeManagers} manager(s) and ${activeEmployees} employee(s).`,
         pendingActions: []
       };
     }
 
     if (resolvedAgentId === "mira") {
       return {
-        reply: `Mira focus: today there are ${todayArrivals} arrivals and ${todayDepartures} departures. In the next 72 hours there are ${upcomingArrivals} arrivals and ${upcomingDepartures} departures to prepare for.`,
+        reply: `${conciseLead}Mira focus: today there are ${todayArrivals} arrivals and ${todayDepartures} departures. In the next 72 hours there are ${upcomingArrivals} arrivals and ${upcomingDepartures} departures to prepare for.`,
+        pendingActions: []
+      };
+    }
+
+    if (resolvedAgentId === "customer_service") {
+      const guestServiceTasks = dashboard.tasks.filter((task) => task.task_type === "guest_service").length;
+      return {
+        reply: `${conciseLead}Customer Service focus: today there are ${todayArrivals} arrivals, ${todayDepartures} departures, and ${guestServiceTasks} guest service task(s) already on the board. In the next 72 hours there are ${upcomingArrivals} arrivals and ${upcomingDepartures} departures to support. Ask me to help with guest messaging, arrival notes, or service recovery follow-up.`,
         pendingActions: []
       };
     }
 
     return {
-      reply: `Today there are ${todayArrivals} arrivals, ${todayDepartures} departures, and ${dashboard.tasks.length} scheduled tasks in the active window. ${urgentTasks > 0 ? `${urgentTasks} task(s) are marked urgent.` : "No urgent tasks are currently flagged."}`,
+      reply: `${conciseLead}Today there are ${todayArrivals} arrivals, ${todayDepartures} departures, and ${dashboard.tasks.length} scheduled tasks in the active window. ${urgentTasks > 0 ? `${urgentTasks} task(s) are marked urgent.` : "No urgent tasks are currently flagged."}`,
       pendingActions: []
     };
   }

@@ -175,6 +175,11 @@ export function createApp({
   publicRateLimitCheckoutMax = parsePositiveInt(process.env.PUBLIC_RATE_LIMIT_CHECKOUT_MAX, 20),
   publicRateLimitChatMax = parsePositiveInt(process.env.PUBLIC_RATE_LIMIT_CHAT_MAX, 12),
   publicRateLimitPortalMax = parsePositiveInt(process.env.PUBLIC_RATE_LIMIT_PORTAL_MAX, 10),
+  staffAuthRateLimitEnabled = `${process.env.STAFF_AUTH_RATE_LIMIT_ENABLED || "true"}`
+    .trim()
+    .toLowerCase() !== "false",
+  staffAuthRateLimitWindowMs = parsePositiveInt(process.env.STAFF_AUTH_RATE_LIMIT_WINDOW_MS, 60000),
+  staffAuthRateLimitMax = parsePositiveInt(process.env.STAFF_AUTH_RATE_LIMIT_MAX, 8),
   syncService = null,
   staffAuthService = null,
   staffOperationsService = null,
@@ -183,6 +188,15 @@ export function createApp({
   guestChatWelcomeBookStateReader = null
 } = {}) {
   const app = express();
+  app.disable("x-powered-by");
+  app.use((_req, res, next) => {
+    res.setHeader("X-Content-Type-Options", "nosniff");
+    res.setHeader("X-Frame-Options", "DENY");
+    res.setHeader("Referrer-Policy", "no-referrer");
+    res.setHeader("Content-Security-Policy", "default-src 'none'; frame-ancestors 'none'; base-uri 'none'; form-action 'none'");
+    res.setHeader("Permissions-Policy", "accelerometer=(), camera=(), geolocation=(), microphone=(), payment=()");
+    return next();
+  });
   app.use(
     express.json({
       limit: "1mb",
@@ -627,7 +641,12 @@ export function createApp({
 
   registerStaffRoutes(app, {
     staffAuthService: internalStaffAuthService,
-    staffOperationsService: internalStaffOperationsService
+    staffOperationsService: internalStaffOperationsService,
+    authRateLimit: {
+      enabled: staffAuthRateLimitEnabled,
+      windowMs: staffAuthRateLimitWindowMs,
+      maxRequests: staffAuthRateLimitMax
+    }
   });
 
   return app;
