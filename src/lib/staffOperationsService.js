@@ -19,6 +19,8 @@ const PROPERTY_OPTIONS = [
 ];
 
 const DEFAULT_STREAM_WINDOW_DAYS = 14;
+const MANAGER_SELECTABLE_AGENT_IDS = ["vincent", "gael", "customer_service"];
+const EMPLOYEE_AGENT_IDS = ["vincent"];
 
 function validateIdentifier(value, label) {
   if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(value)) {
@@ -71,6 +73,28 @@ function roundToNextHour(date = new Date()) {
 function trimText(value, fallback = "") {
   const normalized = `${value || ""}`.trim();
   return normalized || fallback;
+}
+
+function normalizeGaelReply(value) {
+  const stripped = trimText(value)
+    .replace(/\*\*(.*?)\*\*/g, "$1")
+    .replace(/__(.*?)__/g, "$1")
+    .replace(/^#{1,6}\s*/gm, "")
+    .replace(/^[*•]\s+/gm, "- ")
+    .trim();
+  if (!stripped) {
+    return "";
+  }
+  const lines = stripped
+    .split(/\n+/)
+    .map((line) => trimText(line))
+    .filter(Boolean);
+  if (!lines.length) {
+    return "";
+  }
+  return lines
+    .map((line) => (/^(-|\d+\.)\s/.test(line) ? line : `- ${line}`))
+    .join("\n");
 }
 
 function buildActor(actor = {}, fallbackSource = "user") {
@@ -167,6 +191,19 @@ function normalizeInteractionMode(value) {
     return normalized;
   }
   return "text";
+}
+
+function allowedAgentIdsForActor(actor = {}) {
+  const resolvedActor = buildActor(actor);
+  return resolvedActor.isElevatedStaff ? MANAGER_SELECTABLE_AGENT_IDS : EMPLOYEE_AGENT_IDS;
+}
+
+function assertActorCanUseAgent(agentId, actor = {}) {
+  const resolvedActor = buildActor(actor);
+  if (allowedAgentIdsForActor(resolvedActor).includes(agentId)) {
+    return resolvedActor;
+  }
+  throw new Error("agent_access_denied");
 }
 
 function normalizeStreamEvent(row = {}) {
@@ -286,6 +323,7 @@ export class StaffOperationsService {
     this.controlPlaneService = options.controlPlaneService || null;
     this.vincentService = options.vincentService || null;
     this.gaelService = options.gaelService || null;
+    this.elevenLabsService = options.elevenLabsService || null;
     this.syncSchema = validateIdentifier(options.syncSchema || "sync", "sync_schema");
     this.opsSchema = validateIdentifier(options.opsSchema || "ops", "ops_schema");
   }
@@ -691,6 +729,7 @@ export class StaffOperationsService {
     const opsSchema = quoteIdentifier(this.opsSchema);
     const resolvedActor = buildActor(actor);
     const agentId = normalizeAgentId(input.agent_id || input.agentId);
+    assertActorCanUseAgent(agentId, resolvedActor);
     const response = await this.client.query(
       `
         INSERT INTO ${opsSchema}.agent_threads (id, created_by, created_by_email, status)
@@ -710,6 +749,7 @@ export class StaffOperationsService {
     const opsSchema = quoteIdentifier(this.opsSchema);
     const resolvedActor = buildActor(actor);
     const agentId = normalizeAgentId(input.agent_id || input.agentId);
+    assertActorCanUseAgent(agentId, resolvedActor);
     const interactionMode = normalizeInteractionMode(input.interaction_mode || input.interactionMode);
     const attachments = Array.isArray(input.attachments) ? input.attachments : [];
     const transcript = trimText(input.transcript);
@@ -1116,6 +1156,21 @@ export class StaffOperationsService {
       await this.client.query("ROLLBACK");
       throw error;
     }
+  }
+
+  async createVoiceSession(actor = {}, input = {}) {
+    const resolvedActor = buildActor(actor);
+    const agentId = normalizeAgentId(input.agent_id || input.agentId);
+    assertActorCanUseAgent(agentId, resolvedActor);
+    if (!this.elevenLabsService) {
+      throw new Error(`elevenlabs_voice_not_configured:${agentId}`);
+    }
+
+    return this.elevenLabsService.createConversationToken({
+      agentId,
+      userId: resolvedActor.userId,
+      email: resolvedActor.email
+    });
   }
 
   async listChangeEventsAfter(cursor = "0", options = {}) {
@@ -1559,6 +1614,11 @@ export class StaffOperationsService {
       const systemContext = [
         "You are Gael, a manager-only Claude-powered estate systems agent for Exuma Turquoise Resorts.",
         "Focus on operations strategy, workflow design, staffing coordination, automation ideas, implementation planning, and crisp decision support.",
+        "Be direct, skeptical, and neutral. Do not be upbeat, congratulatory, or motivational.",
+        "Keep responses short.",
+        "Output plain text only.",
+        "Use only numbered lists or hyphen bullet lists.",
+        "Do not use markdown emphasis, asterisks, headings, emojis, or decorative formatting.",
         "Do not claim an action was executed unless the system explicitly tells you it was completed.",
         dashboardSummary,
         `Current staff user: ${actor.email || actor.userId || "unknown"}`
@@ -1566,11 +1626,13 @@ export class StaffOperationsService {
       const gaelResponse = await this.gaelService.sendConversation({
         system: systemContext,
         messages: anthropicMessages,
-        maxOutputTokens: interactionMode === "voice_call" ? 300 : 700
+        maxOutputTokens: interactionMode === "voice_call" ? 220 : 350
       });
 
       return {
-        reply: trimText(gaelResponse.reply) || `${conciseLead}Gael did not return a reply.`,
+        reply:
+          normalizeGaelReply(gaelResponse.reply) ||
+          "- Gael did not return a reply.",
         pendingActions: [],
         metadata: {
           gael_connected: true,
