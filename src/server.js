@@ -167,6 +167,7 @@ export function createApp({
     process.env.WORDPRESS_COMMAND_SECRET ||
     process.env.SYNC_HMAC_SECRET ||
     "",
+  vincentApiSecret = process.env.VINCENT_API_SECRET || internalApiSecret,
   publicRateLimitEnabled = `${process.env.PUBLIC_RATE_LIMIT_ENABLED || "true"}`
     .trim()
     .toLowerCase() !== "false",
@@ -220,8 +221,9 @@ export function createApp({
   let internalStaffAuthService = staffAuthService;
   let internalStaffOperationsService = staffOperationsService;
   const vincentService = new VincentService({
-    internalApiSecret
+    internalApiSecret: vincentApiSecret
   });
+  app.locals.vincentService = vincentService;
   const gaelService = new AnthropicAgentService();
   if (!ingestService && syncDatabaseUrl) {
     ingestService = new ControlPlaneService({
