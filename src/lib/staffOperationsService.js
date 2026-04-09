@@ -2137,6 +2137,7 @@ export class StaffOperationsService {
           maxOutputTokens: interactionMode === "voice_call" ? 320 : 700,
           temperature: 0.1
         });
+        const heuristicTaskDraft = buildAgentTaskDraft(message);
         const parsedPlan = normalizeGaelPlan(extractJsonObject(planningResponse.reply), message);
         if (parsedPlan) {
           const summary = buildGaelPlanSummary(parsedPlan);
@@ -2166,6 +2167,40 @@ export class StaffOperationsService {
           }
 
           if (parsedPlan.needsFollowUp) {
+            const partialTasks = Array.isArray(parsedPlan.tasks) && parsedPlan.tasks.length
+              ? parsedPlan.tasks
+              : heuristicTaskDraft
+                ? [heuristicTaskDraft]
+                : [];
+            const partialPeople = Array.isArray(parsedPlan.people) ? parsedPlan.people : [];
+            if (partialPeople.length || partialTasks.length) {
+              return {
+                reply:
+                  normalizeGaelReply(trimText(parsedPlan.reply)) ||
+                  "- Prepared the executable part.\n- Confirm to apply.\n- I still need a few missing details.",
+                pendingActions: [
+                  buildGaelPlanAction(
+                    {
+                      ...parsedPlan,
+                      people: partialPeople,
+                      tasks: partialTasks,
+                      requestedSummary: message
+                    },
+                    threadId,
+                    actor
+                  )
+                ],
+                metadata: {
+                  gael_connected: true,
+                  gael_model: trimText(planningResponse.model),
+                  gael_stop_reason: trimText(planningResponse.stop_reason),
+                  gael_usage: planningResponse.usage || {},
+                  gael_plan_detected: true,
+                  gael_needs_follow_up: true,
+                  gael_partial_plan: true
+                }
+              };
+            }
             const followUpReply =
               normalizeGaelReply(trimText(parsedPlan.reply)) ||
               parsedPlan.followUpQuestions.map((question) => `- ${question}`).join("\n") ||
@@ -2187,7 +2222,6 @@ export class StaffOperationsService {
         }
 
         const planningFallbackReply = normalizeGaelReply(planningResponse.reply);
-        const heuristicTaskDraft = buildAgentTaskDraft(message);
         if (heuristicTaskDraft) {
           return {
             reply: mentionsPeopleRequest
