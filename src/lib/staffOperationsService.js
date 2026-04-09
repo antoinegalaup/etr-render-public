@@ -339,11 +339,11 @@ function buildAgentTaskDraft(message) {
 function looksLikeGaelPlanningRequest(message) {
   const normalized = `${message || ""}`.toLowerCase();
   const peopleIntent =
-    /(add|create|hire|bring in|onboard|set up|assign)/.test(normalized) &&
+    /(add|create|hire|bring in|onboard|set up|assign|update|change|edit|rename|activate|deactivate|remove)/.test(normalized) &&
     /(employee|manager|staff|person|people|team)/.test(normalized);
   const taskIntent =
-    /(add|create|schedule|assign|put|turn|convert|make|plan|queue)/.test(normalized) &&
-    /(task|tasks|calendar|schedule|shift|checklist|assignment|assignments)/.test(normalized);
+    /(add|create|schedule|assign|put|turn|convert|make|plan|queue|update|change|move|reschedule|cancel|complete|finish|mark|edit|rename)/.test(normalized) &&
+    /(task|tasks|calendar|schedule|shift|checklist|assignment|assignments|prep|arrival|departure)/.test(normalized);
   return peopleIntent || taskIntent;
 }
 
@@ -475,17 +475,30 @@ function normalizeGaelPlan(rawPlan = {}, requestedSummary = "") {
   const tasks = Array.isArray(rawPlan.tasks)
     ? rawPlan.tasks.map((entry) => normalizePlannedTask(entry, requestedSummary)).filter(Boolean)
     : [];
+  const peopleUpdates = Array.isArray(rawPlan.people_updates || rawPlan.peopleUpdates)
+    ? (rawPlan.people_updates || rawPlan.peopleUpdates)
+        .map((entry) => normalizePlannedPersonUpdate(entry))
+        .filter(Boolean)
+    : [];
+  const taskUpdates = Array.isArray(rawPlan.task_updates || rawPlan.taskUpdates)
+    ? (rawPlan.task_updates || rawPlan.taskUpdates)
+        .map((entry) => normalizePlannedTaskUpdate(entry, requestedSummary))
+        .filter(Boolean)
+    : [];
   const reply = trimText(rawPlan.reply);
   const needsFollowUp = Boolean(rawPlan.needs_follow_up || rawPlan.needsFollowUp);
   const followUpQuestions = Array.isArray(rawPlan.follow_up_questions || rawPlan.followUpQuestions)
     ? (rawPlan.follow_up_questions || rawPlan.followUpQuestions)
         .map((entry) => trimText(entry))
         .filter(Boolean)
+        .slice(0, 1)
     : [];
   return {
     reply,
     people,
     tasks,
+    people_updates: peopleUpdates,
+    task_updates: taskUpdates,
     needsFollowUp,
     followUpQuestions
   };
@@ -494,6 +507,8 @@ function normalizeGaelPlan(rawPlan = {}, requestedSummary = "") {
 function buildGaelPlanSummary(plan) {
   const peopleCount = Array.isArray(plan.people) ? plan.people.length : 0;
   const taskCount = Array.isArray(plan.tasks) ? plan.tasks.length : 0;
+  const peopleUpdatesCount = Array.isArray(plan.people_updates) ? plan.people_updates.length : 0;
+  const taskUpdatesCount = Array.isArray(plan.task_updates) ? plan.task_updates.length : 0;
   const parts = [];
   if (peopleCount) {
     parts.push(`add ${peopleCount} ${peopleCount === 1 ? "person" : "people"}`);
@@ -501,11 +516,203 @@ function buildGaelPlanSummary(plan) {
   if (taskCount) {
     parts.push(`schedule ${taskCount} ${taskCount === 1 ? "task" : "tasks"}`);
   }
+  if (peopleUpdatesCount) {
+    parts.push(`update ${peopleUpdatesCount} ${peopleUpdatesCount === 1 ? "person" : "people"}`);
+  }
+  if (taskUpdatesCount) {
+    parts.push(`update ${taskUpdatesCount} ${taskUpdatesCount === 1 ? "task" : "tasks"}`);
+  }
   return parts.join(" and ");
 }
 
 function hasGaelPlanChanges(plan = {}) {
-  return Boolean((Array.isArray(plan.people) && plan.people.length) || (Array.isArray(plan.tasks) && plan.tasks.length));
+  return Boolean(
+    (Array.isArray(plan.people) && plan.people.length) ||
+      (Array.isArray(plan.tasks) && plan.tasks.length) ||
+      (Array.isArray(plan.people_updates) && plan.people_updates.length) ||
+      (Array.isArray(plan.task_updates) && plan.task_updates.length)
+  );
+}
+
+function inferMissingPersonQuestion(message = "") {
+  const normalized = `${message || ""}`.toLowerCase();
+  if (normalized.includes("manager")) {
+    return "Who should I add as the manager?";
+  }
+  if (/(employee|staff|person|people|team)/.test(normalized)) {
+    return "Who should I add as the employee?";
+  }
+  return "Who should I add?";
+}
+
+function buildSingleFollowUpReply(question, preparedLabel = "") {
+  const lines = [];
+  const normalizedPreparedLabel = trimText(preparedLabel);
+  if (normalizedPreparedLabel) {
+    lines.push(`- ${normalizedPreparedLabel}`);
+  }
+  if (trimText(question)) {
+    lines.push(`- ${trimText(question).replace(/^[*-]\s*/, "").replace(/\?*$/, "?")}`);
+  }
+  return lines.join("\n");
+}
+
+function normalizePlannedPersonPatch(input = {}) {
+  const patch = {};
+  if ("full_name" in input || "fullName" in input) {
+    const fullName = trimText(input.full_name || input.fullName);
+    if (fullName) {
+      patch.full_name = fullName;
+    }
+  }
+  if ("role" in input) {
+    const role = normalizePlannedRole(input.role) || trimText(input.role);
+    if (role) {
+      patch.role = role;
+    }
+  }
+  if ("phone" in input) {
+    patch.phone = trimText(input.phone) || null;
+  }
+  if ("email" in input) {
+    patch.email = trimText(input.email).toLowerCase() || null;
+  }
+  if ("accent_color" in input || "accentColor" in input) {
+    patch.accent_color = trimText(input.accent_color || input.accentColor) || null;
+  }
+  if ("notes" in input) {
+    patch.notes = trimText(input.notes) || null;
+  }
+  if ("is_active" in input) {
+    patch.is_active = Boolean(input.is_active);
+  }
+  if ("isActive" in input) {
+    patch.is_active = Boolean(input.isActive);
+  }
+  return Object.keys(patch).length ? patch : null;
+}
+
+function normalizePlannedPersonUpdate(input = {}) {
+  const matchInput = input.match && typeof input.match === "object" ? input.match : input;
+  const patchInput =
+    input.patch && typeof input.patch === "object"
+      ? input.patch
+      : input.updates && typeof input.updates === "object"
+        ? input.updates
+        : {};
+  const match = {
+    id: trimText(matchInput.id || matchInput.person_id || matchInput.personId) || null,
+    full_name: trimText(matchInput.full_name || matchInput.fullName) || null,
+    email: trimText(matchInput.email).toLowerCase() || null
+  };
+  const patch = normalizePlannedPersonPatch(patchInput);
+  if (!patch) {
+    return null;
+  }
+  if (!match.id && !match.full_name && !match.email) {
+    return null;
+  }
+  return { match, patch };
+}
+
+function normalizePlannedTaskPatch(input = {}, requestedSummary = "") {
+  const patch = {};
+  if ("title" in input) {
+    const title = trimText(input.title);
+    if (title) {
+      patch.title = title;
+    }
+  }
+  if ("notes" in input) {
+    patch.notes = trimText(input.notes) || null;
+  }
+  if ("task_type" in input || "taskType" in input) {
+    const taskType = trimText(input.task_type || input.taskType);
+    if (taskType) {
+      patch.task_type = taskType;
+    }
+  }
+  if ("status" in input) {
+    const status = trimText(input.status);
+    if (status) {
+      patch.status = status;
+    }
+  }
+  if ("priority" in input) {
+    const priority = trimText(input.priority);
+    if (priority) {
+      patch.priority = priority;
+    }
+  }
+  if ("start_at" in input || "startAt" in input) {
+    const startAt = trimText(input.start_at || input.startAt);
+    if (startAt && !Number.isNaN(Date.parse(startAt))) {
+      patch.start_at = new Date(startAt).toISOString();
+    }
+  }
+  if ("end_at" in input || "endAt" in input) {
+    const endAt = trimText(input.end_at || input.endAt);
+    if (endAt && !Number.isNaN(Date.parse(endAt))) {
+      patch.end_at = new Date(endAt).toISOString();
+    }
+  }
+  if ("property_label" in input || "propertyLabel" in input) {
+    const propertyLabel =
+      trimText(input.property_label || input.propertyLabel) || resolvePropertyLabel(requestedSummary);
+    if (propertyLabel) {
+      patch.property_label = propertyLabel;
+    }
+  }
+  if ("reservation_uuid" in input || "reservationUUID" in input) {
+    patch.reservation_uuid = trimText(input.reservation_uuid || input.reservationUUID) || null;
+  }
+  if ("assignee_ids" in input || "assigneeIDs" in input) {
+    patch.assignee_ids = Array.isArray(input.assignee_ids || input.assigneeIDs)
+      ? Array.from(new Set((input.assignee_ids || input.assigneeIDs).filter(Boolean)))
+      : [];
+  }
+  if ("assignee_names" in input || "assigneeNames" in input) {
+    patch.assignee_names = Array.isArray(input.assignee_names || input.assigneeNames)
+      ? Array.from(new Set((input.assignee_names || input.assigneeNames).map((entry) => trimText(entry)).filter(Boolean)))
+      : [];
+  }
+  if ("assignee_emails" in input || "assigneeEmails" in input) {
+    patch.assignee_emails = Array.isArray(input.assignee_emails || input.assigneeEmails)
+      ? Array.from(
+          new Set(
+            (input.assignee_emails || input.assigneeEmails)
+              .map((entry) => trimText(entry).toLowerCase())
+              .filter(Boolean)
+          )
+        )
+      : [];
+  }
+  return Object.keys(patch).length ? patch : null;
+}
+
+function normalizePlannedTaskUpdate(input = {}, requestedSummary = "") {
+  const matchInput = input.match && typeof input.match === "object" ? input.match : input;
+  const patchInput =
+    input.patch && typeof input.patch === "object"
+      ? input.patch
+      : input.updates && typeof input.updates === "object"
+        ? input.updates
+        : {};
+  const match = {
+    id: trimText(matchInput.id || matchInput.task_id || matchInput.taskId) || null,
+    title: trimText(matchInput.title) || null,
+    property_label:
+      trimText(matchInput.property_label || matchInput.propertyLabel) || resolvePropertyLabel(matchInput.title || requestedSummary) || null,
+    start_at: trimText(matchInput.start_at || matchInput.startAt) || null
+  };
+  const patch = normalizePlannedTaskPatch(patchInput, requestedSummary);
+  if (!patch) {
+    return null;
+  }
+  if (!match.id && !match.title && !match.property_label && !match.start_at) {
+    return null;
+  }
+  return { match, patch };
 }
 
 function hasNamedStaffHints(message = "") {
@@ -542,7 +749,9 @@ function buildGaelPlanAction(plan, threadId, actor = {}) {
     command_payload: {
       requested_summary: trimText(plan.requestedSummary),
       people: plan.people,
-      tasks: plan.tasks
+      tasks: plan.tasks,
+      people_updates: plan.people_updates,
+      task_updates: plan.task_updates
     },
     created_by: actor.userId || null
   };
@@ -819,6 +1028,142 @@ export class StaffOperationsService {
     return Array.from(new Set([...nameIds, ...emailIds]));
   }
 
+  async findPersonForPlannedUpdate(match = {}, options = {}) {
+    if (!options.skipReadyCheck) {
+      await this.ensureReady();
+    }
+    const opsSchema = quoteIdentifier(this.opsSchema);
+    const id = trimText(match.id);
+    const email = trimText(match.email).toLowerCase();
+    const fullName = trimText(match.full_name || match.fullName);
+
+    if (!id && !email && !fullName) {
+      throw new Error("person_update_target_missing");
+    }
+
+    if (id) {
+      const response = await this.client.query(
+        `
+          SELECT id, full_name, email, role, is_active
+          FROM ${opsSchema}.people
+          WHERE id = $1::uuid
+          LIMIT 1
+        `,
+        [id]
+      );
+      if (!response.rows.length) {
+        throw new Error("person_update_target_not_found");
+      }
+      return response.rows[0];
+    }
+
+    const clauses = [];
+    const values = [];
+    if (email) {
+      values.push(email);
+      clauses.push(`LOWER(email) = $${values.length}`);
+    }
+    if (fullName) {
+      values.push(fullName.toLowerCase());
+      clauses.push(`LOWER(full_name) = $${values.length}`);
+    }
+    const response = await this.client.query(
+      `
+        SELECT id, full_name, email, role, is_active
+        FROM ${opsSchema}.people
+        WHERE ${clauses.join(" AND ")}
+        ORDER BY is_active DESC, full_name ASC
+        LIMIT 2
+      `,
+      values
+    );
+    if (!response.rows.length) {
+      throw new Error("person_update_target_not_found");
+    }
+    if (response.rows.length > 1) {
+      throw new Error("person_update_target_ambiguous");
+    }
+    return response.rows[0];
+  }
+
+  async findTaskForPlannedUpdate(match = {}, options = {}) {
+    if (!options.skipReadyCheck) {
+      await this.ensureReady();
+    }
+    const opsSchema = quoteIdentifier(this.opsSchema);
+    const id = trimText(match.id);
+    const title = trimText(match.title);
+    const propertyLabel = trimText(match.property_label || match.propertyLabel);
+    const startAt = trimText(match.start_at || match.startAt);
+
+    if (!id && !title && !propertyLabel && !startAt) {
+      throw new Error("task_update_target_missing");
+    }
+
+    if (id) {
+      const response = await this.client.query(
+        `
+          SELECT
+            id,
+            title,
+            property_label,
+            start_at,
+            end_at,
+            status,
+            priority
+          FROM ${opsSchema}.calendar_tasks
+          WHERE id = $1::uuid
+          LIMIT 1
+        `,
+        [id]
+      );
+      if (!response.rows.length) {
+        throw new Error("task_update_target_not_found");
+      }
+      return response.rows[0];
+    }
+
+    const clauses = [];
+    const values = [];
+    if (title) {
+      values.push(title.toLowerCase());
+      clauses.push(`LOWER(title) = $${values.length}`);
+    }
+    if (propertyLabel) {
+      values.push(propertyLabel.toLowerCase());
+      clauses.push(`LOWER(property_label) = $${values.length}`);
+    }
+    if (startAt && !Number.isNaN(Date.parse(startAt))) {
+      values.push(new Date(startAt).toISOString());
+      clauses.push(`start_at = $${values.length}::timestamptz`);
+    }
+
+    const response = await this.client.query(
+      `
+        SELECT
+          id,
+          title,
+          property_label,
+          start_at,
+          end_at,
+          status,
+          priority
+        FROM ${opsSchema}.calendar_tasks
+        WHERE ${clauses.join(" AND ")}
+        ORDER BY start_at ASC, created_at ASC
+        LIMIT 2
+      `,
+      values
+    );
+    if (!response.rows.length) {
+      throw new Error("task_update_target_not_found");
+    }
+    if (response.rows.length > 1) {
+      throw new Error("task_update_target_ambiguous");
+    }
+    return response.rows[0];
+  }
+
   async createPerson(input = {}, actor = {}) {
     await this.ensureReady();
     await this.client.query("BEGIN");
@@ -937,8 +1282,135 @@ export class StaffOperationsService {
     }
   }
 
+  async updatePerson(personId, input = {}, actor = {}) {
+    await this.ensureReady();
+    await this.client.query("BEGIN");
+    try {
+      const person = await this._updatePersonWithinTransaction(personId, input, actor, {
+        source: actor.source || "user"
+      });
+      await this.client.query("COMMIT");
+      return person;
+    } catch (error) {
+      await this.client.query("ROLLBACK");
+      throw error;
+    }
+  }
+
   async updateTask(taskId, input = {}, actor = {}) {
     await this.ensureReady();
+    await this.client.query("BEGIN");
+    try {
+      const task = await this._updateTaskWithinTransaction(taskId, input, actor, {
+        source: actor.source || "user"
+      });
+      await this.client.query("COMMIT");
+      return task;
+    } catch (error) {
+      await this.client.query("ROLLBACK");
+      throw error;
+    }
+  }
+
+  async _updatePersonWithinTransaction(personId, input = {}, actor = {}, options = {}) {
+    const resolvedActor = buildActor(actor, options.source || "user");
+    const opsSchema = quoteIdentifier(this.opsSchema);
+    const fields = [];
+    const values = [];
+    const addField = (column, value, cast = "") => {
+      values.push(value);
+      fields.push(`${column} = $${values.length}${cast}`);
+    };
+
+    if ("full_name" in input || "fullName" in input) {
+      addField("full_name", trimText(input.full_name || input.fullName));
+    }
+    if ("role" in input) addField("role", trimText(input.role));
+    if ("phone" in input) addField("phone", trimText(input.phone) || null);
+    if ("email" in input) addField("email", trimText(input.email).toLowerCase() || null);
+    if ("accent_color" in input || "accentColor" in input) {
+      addField("accent_color", trimText(input.accent_color || input.accentColor) || null);
+    }
+    if ("notes" in input) addField("notes", trimText(input.notes) || null);
+    if ("is_active" in input) addField("is_active", input.is_active, "::boolean");
+    if ("isActive" in input) addField("is_active", input.isActive, "::boolean");
+
+    if (!fields.length) {
+      throw new Error("person_patch_empty");
+    }
+
+    values.push(personId);
+    const response = await this.client.query(
+      `
+        UPDATE ${opsSchema}.people
+        SET ${fields.join(", ")}
+        WHERE id = $${values.length}::uuid
+        RETURNING
+          id,
+          full_name,
+          role,
+          phone,
+          email,
+          accent_color,
+          notes,
+          is_active
+      `,
+      values
+    );
+    if (!response.rows.length) {
+      throw new Error("person_not_found");
+    }
+
+    await this.recordAuditLog(
+      {
+        actor: resolvedActor,
+        eventType: "person.updated",
+        entityType: "person",
+        entityId: response.rows[0].id,
+        details: input
+      },
+      { skipReadyCheck: true }
+    );
+    await this.emitChangeEvent(
+      {
+        type: "person.updated",
+        changedDomains: ["people"],
+        payload: {
+          person_id: response.rows[0].id
+        }
+      },
+      { skipReadyCheck: true }
+    );
+
+    return response.rows[0];
+  }
+
+  async _replaceTaskAssignmentsWithinTransaction(taskId, assigneeIds = []) {
+    const opsSchema = quoteIdentifier(this.opsSchema);
+    await this.client.query(
+      `
+        DELETE FROM ${opsSchema}.task_assignees
+        WHERE task_id = $1::uuid
+      `,
+      [taskId]
+    );
+
+    for (const personId of Array.from(new Set((assigneeIds || []).filter(Boolean)))) {
+      await this.client.query(
+        `
+          INSERT INTO ${opsSchema}.task_assignees
+            (task_id, person_id)
+          VALUES
+            ($1::uuid, $2::uuid)
+          ON CONFLICT (task_id, person_id) DO NOTHING
+        `,
+        [taskId, personId]
+      );
+    }
+  }
+
+  async _updateTaskWithinTransaction(taskId, input = {}, actor = {}, options = {}) {
+    const resolvedActor = buildActor(actor, options.source || "user");
     const opsSchema = quoteIdentifier(this.opsSchema);
     const fields = [];
     const values = [];
@@ -949,21 +1421,39 @@ export class StaffOperationsService {
 
     if ("title" in input) addField("title", trimText(input.title));
     if ("notes" in input) addField("notes", trimText(input.notes) || null);
-    if ("task_type" in input) addField("task_type", trimText(input.task_type));
+    if ("task_type" in input || "taskType" in input) {
+      addField("task_type", trimText(input.task_type || input.taskType));
+    }
     if ("status" in input) addField("status", trimText(input.status));
     if ("priority" in input) addField("priority", trimText(input.priority));
-    if ("start_at" in input) addField("start_at", input.start_at, "::timestamptz");
-    if ("end_at" in input) addField("end_at", input.end_at, "::timestamptz");
-    if ("property_label" in input) addField("property_label", trimText(input.property_label));
-    if ("reservation_uuid" in input) addField("reservation_uuid", input.reservation_uuid, "::uuid");
+    if ("start_at" in input || "startAt" in input) {
+      addField("start_at", input.start_at || input.startAt, "::timestamptz");
+    }
+    if ("end_at" in input || "endAt" in input) {
+      addField("end_at", input.end_at || input.endAt, "::timestamptz");
+    }
+    if ("property_label" in input || "propertyLabel" in input) {
+      addField("property_label", trimText(input.property_label || input.propertyLabel));
+    }
+    if ("reservation_uuid" in input || "reservationUUID" in input) {
+      addField("reservation_uuid", input.reservation_uuid || input.reservationUUID || null, "::uuid");
+    }
 
-    if (!fields.length) {
+    const wantsAssignmentRewrite =
+      "assignee_ids" in input ||
+      "assigneeIDs" in input ||
+      "assignee_names" in input ||
+      "assigneeNames" in input ||
+      "assignee_emails" in input ||
+      "assigneeEmails" in input;
+
+    if (!fields.length && !wantsAssignmentRewrite) {
       throw new Error("task_patch_empty");
     }
 
-    values.push(taskId);
-    await this.client.query("BEGIN");
-    try {
+    let task = null;
+    if (fields.length) {
+      values.push(taskId);
       const response = await this.client.query(
         `
           UPDATE ${opsSchema}.calendar_tasks
@@ -988,37 +1478,71 @@ export class StaffOperationsService {
       if (!response.rows.length) {
         throw new Error("task_not_found");
       }
-
-      await this.recordAuditLog(
-        {
-          actor,
-          eventType: "task.updated",
-          entityType: "calendar_task",
-          entityId: response.rows[0].id,
-          details: input
-        },
-        { skipReadyCheck: true }
+      task = response.rows[0];
+    } else {
+      const response = await this.client.query(
+        `
+          SELECT
+            id,
+            title,
+            notes,
+            task_type,
+            status,
+            priority,
+            start_at,
+            end_at,
+            property_label,
+            reservation_uuid,
+            created_at,
+            updated_at
+          FROM ${opsSchema}.calendar_tasks
+          WHERE id = $1::uuid
+          LIMIT 1
+        `,
+        [taskId]
       );
-      await this.emitChangeEvent(
-        {
-          type: "task.updated",
-          changedDomains: ["tasks"],
-          recommendedWindow: {
-            from: response.rows[0].start_at,
-            to: response.rows[0].end_at
-          },
-          payload: {
-            task_id: response.rows[0].id
-          }
-        },
-        { skipReadyCheck: true }
-      );
-      await this.client.query("COMMIT");
-      return response.rows[0];
-    } catch (error) {
-      await this.client.query("ROLLBACK");
-      throw error;
+      if (!response.rows.length) {
+        throw new Error("task_not_found");
+      }
+      task = response.rows[0];
     }
+
+    let resolvedAssigneeIds = null;
+    if (wantsAssignmentRewrite) {
+      const availablePeople = options.availablePeople || (await this.listPeopleForAssignment({ skipReadyCheck: true }));
+      resolvedAssigneeIds = this.resolveAssigneeIds(input, availablePeople);
+      await this._replaceTaskAssignmentsWithinTransaction(taskId, resolvedAssigneeIds);
+    }
+
+    await this.recordAuditLog(
+      {
+        actor: resolvedActor,
+        eventType: "task.updated",
+        entityType: "calendar_task",
+        entityId: task.id,
+        details: {
+          ...input,
+          ...(resolvedAssigneeIds ? { assignee_ids: resolvedAssigneeIds } : {})
+        }
+      },
+      { skipReadyCheck: true }
+    );
+    await this.emitChangeEvent(
+      {
+        type: "task.updated",
+        changedDomains: resolvedAssigneeIds ? ["tasks", "assignments"] : ["tasks"],
+        recommendedWindow: {
+          from: task.start_at,
+          to: task.end_at
+        },
+        payload: {
+          task_id: task.id
+        }
+      },
+      { skipReadyCheck: true }
+    );
+
+    return task;
   }
 
   async createAgentThread(actor = {}, input = {}) {
@@ -1383,7 +1907,18 @@ export class StaffOperationsService {
         const payload = action.command_payload || {};
         const plannedPeople = Array.isArray(payload.people) ? payload.people : [];
         const plannedTasks = Array.isArray(payload.tasks) ? payload.tasks : [];
-        if (!plannedPeople.length && !plannedTasks.length) {
+        const plannedPersonUpdates = Array.isArray(payload.people_updates || payload.peopleUpdates)
+          ? payload.people_updates || payload.peopleUpdates
+          : [];
+        const plannedTaskUpdates = Array.isArray(payload.task_updates || payload.taskUpdates)
+          ? payload.task_updates || payload.taskUpdates
+          : [];
+        if (
+          !plannedPeople.length &&
+          !plannedTasks.length &&
+          !plannedPersonUpdates.length &&
+          !plannedTaskUpdates.length
+        ) {
           throw new Error("agent_plan_empty");
         }
 
@@ -1430,6 +1965,61 @@ export class StaffOperationsService {
           createdTasks.push(createdTask);
         }
 
+        const updatedPeople = [];
+        for (const personUpdate of plannedPersonUpdates) {
+          const matchedPerson = await this.findPersonForPlannedUpdate(personUpdate.match, {
+            skipReadyCheck: true
+          });
+          const updatedPerson = await this._updatePersonWithinTransaction(
+            matchedPerson.id,
+            personUpdate.patch,
+            resolvedActor,
+            {
+              source: "agent"
+            }
+          );
+          updatedPeople.push(updatedPerson);
+          const personIndex = availablePeople.findIndex((person) => person.id === updatedPerson.id);
+          if (personIndex >= 0) {
+            availablePeople[personIndex] = {
+              ...availablePeople[personIndex],
+              ...updatedPerson
+            };
+          } else {
+            availablePeople.push(updatedPerson);
+          }
+        }
+
+        const updatedTasks = [];
+        for (const taskUpdate of plannedTaskUpdates) {
+          const matchedTask = await this.findTaskForPlannedUpdate(taskUpdate.match, {
+            skipReadyCheck: true
+          });
+          const hasAssignmentPatch =
+            "assignee_ids" in taskUpdate.patch ||
+            "assigneeIDs" in taskUpdate.patch ||
+            "assignee_names" in taskUpdate.patch ||
+            "assigneeNames" in taskUpdate.patch ||
+            "assignee_emails" in taskUpdate.patch ||
+            "assigneeEmails" in taskUpdate.patch;
+          const resolvedAssigneeIds = hasAssignmentPatch
+            ? this.resolveAssigneeIds(taskUpdate.patch, availablePeople)
+            : [];
+          const updatedTask = await this._updateTaskWithinTransaction(
+            matchedTask.id,
+            {
+              ...taskUpdate.patch,
+              ...(hasAssignmentPatch ? { assignee_ids: resolvedAssigneeIds } : {})
+            },
+            resolvedActor,
+            {
+              source: "agent",
+              availablePeople
+            }
+          );
+          updatedTasks.push(updatedTask);
+        }
+
         const executionResult = {
           status: "succeeded",
           people_created: createdPeople.map((person) => ({
@@ -1443,6 +2033,18 @@ export class StaffOperationsService {
             role: person.role
           })),
           tasks_created: createdTasks.map((task) => ({
+            id: task.id,
+            title: task.title,
+            property_label: task.property_label,
+            start_at: task.start_at,
+            end_at: task.end_at
+          })),
+          people_updated: updatedPeople.map((person) => ({
+            id: person.id,
+            full_name: person.full_name,
+            role: person.role
+          })),
+          tasks_updated: updatedTasks.map((task) => ({
             id: task.id,
             title: task.title,
             property_label: task.property_label,
@@ -2069,9 +2671,10 @@ export class StaffOperationsService {
         looksLikeGaelPlanningRequest(message) &&
         !hasNamedStaffHints(message)
       ) {
+        const singleFollowUpQuestion = mentionsPeopleRequest ? inferMissingPersonQuestion(message) : "";
         return {
           reply: mentionsPeopleRequest
-            ? "- Prepared the task plan.\n- Confirm to apply.\n- Send staff names if you want people added too."
+            ? buildSingleFollowUpReply(singleFollowUpQuestion, "Prepared the task plan.")
             : "- Prepared the task plan.\n- Confirm to apply.",
           pendingActions: [
             buildGaelPlanAction(
@@ -2088,12 +2691,14 @@ export class StaffOperationsService {
             gael_connected: true,
             gael_model: "heuristic",
             gael_heuristic_plan: true,
-            gael_bypassed_model: true
+            gael_bypassed_model: true,
+            ...(mentionsPeopleRequest ? { gael_needs_follow_up: true, gael_partial_plan: true } : {})
           }
         };
       }
       let dashboardSummary = "Live dashboard summary is currently unavailable.";
       let peopleDirectorySummary = "Current active staff directory is unavailable.";
+      let taskDirectorySummary = "Current scheduled tasks are unavailable.";
       let dashboard = null;
       if (this.client) {
         dashboard = await this.getDashboard({
@@ -2109,6 +2714,16 @@ export class StaffOperationsService {
         peopleDirectorySummary = activePeopleSummary
           ? `Current active staff directory: ${activePeopleSummary}.`
           : "Current active staff directory has no active people.";
+        const scheduledTaskSummary = dashboard.tasks
+          .slice(0, 25)
+          .map(
+            (task) =>
+              `${task.id}: ${task.title} @ ${task.property_label} starting ${new Date(task.start_at).toISOString()}`
+          )
+          .join("; ");
+        taskDirectorySummary = scheduledTaskSummary
+          ? `Current scheduled tasks in window: ${scheduledTaskSummary}.`
+          : "Current scheduled tasks in window: none.";
       }
 
       const shouldAttemptPlanning = looksLikeGaelPlanningRequest(message) || interactionMode !== "voice_call";
@@ -2116,18 +2731,22 @@ export class StaffOperationsService {
         const planningSystem = [
           "You are Gael, a manager-only Claude-powered estate systems agent for Exuma Turquoise Resorts.",
           "First decide whether the manager is asking you to change operations state.",
-          "If the request implies creating people, staffing, assignments, shifts, tasks, schedules, plans, or turning an idea into work, return a structured execution plan.",
-          "If the request is only advisory, return empty people and tasks arrays.",
+          "If the request implies creating or updating people, staffing, assignments, shifts, tasks, schedules, plans, or turning an idea into work, return a structured execution plan.",
+          "If the request is only advisory, return empty create and update arrays.",
           "Return JSON only. Do not wrap the response in markdown.",
-          'Schema: {"reply":string,"needs_follow_up":boolean,"follow_up_questions":string[],"people":[{"full_name":string,"role":"Manager"|"Employee","phone":string|null,"email":string|null,"notes":string|null,"is_active":boolean}],"tasks":[{"title":string,"notes":string|null,"task_type":string,"priority":string,"property_label":string,"start_at":string,"end_at":string,"assignee_names":string[],"assignee_emails":string[]}]}',
+          'Schema: {"reply":string,"needs_follow_up":boolean,"follow_up_questions":string[],"people":[{"full_name":string,"role":"Manager"|"Employee","phone":string|null,"email":string|null,"notes":string|null,"is_active":boolean}],"tasks":[{"title":string,"notes":string|null,"task_type":string,"priority":string,"property_label":string,"start_at":string,"end_at":string,"assignee_names":string[],"assignee_emails":string[]}],"people_updates":[{"match":{"id":string|null,"full_name":string|null,"email":string|null},"patch":{"full_name":string|null,"role":"Manager"|"Employee"|null,"phone":string|null,"email":string|null,"notes":string|null,"accent_color":string|null,"is_active":boolean|null}}],"task_updates":[{"match":{"id":string|null,"title":string|null,"property_label":string|null,"start_at":string|null},"patch":{"title":string|null,"notes":string|null,"task_type":string|null,"status":string|null,"priority":string|null,"property_label":string|null,"start_at":string|null,"end_at":string|null,"assignee_names":string[],"assignee_emails":string[]}}]}',
           "Use ISO-8601 timestamps.",
           "Today is 2026-04-09 in America/New_York.",
           "If the manager says today or tomorrow and no time is given, default to 09:00 local with a one hour duration.",
           "Allowed people roles are Manager and Employee only.",
           "Known property labels include KL Cottage, Lake Cottage, Villa Esencia, and Property TBD.",
-          "If critical details are missing for an execution request, set needs_follow_up to true and ask concise follow-up questions instead of inventing unsafe details.",
+          "You can safely prepare database mutations for ops.people, ops.calendar_tasks, and ops.task_assignees.",
+          "Use people/tasks for creates. Use people_updates/task_updates for edits to existing records.",
+          "Ask at most one blocking follow-up question at a time.",
+          "If critical details are missing for an execution request, set needs_follow_up to true and put only the highest-leverage question in follow_up_questions.",
           dashboardSummary,
           peopleDirectorySummary,
+          taskDirectorySummary,
           `Current staff user: ${actor.email || actor.userId || "unknown"}`
         ].join(" ");
 
@@ -2141,6 +2760,7 @@ export class StaffOperationsService {
         const parsedPlan = normalizeGaelPlan(extractJsonObject(planningResponse.reply), message);
         if (parsedPlan) {
           const summary = buildGaelPlanSummary(parsedPlan);
+          const firstFollowUpQuestion = parsedPlan.followUpQuestions[0] || "";
           if (hasGaelPlanChanges(parsedPlan) && !parsedPlan.needsFollowUp) {
             return {
               reply:
@@ -2173,17 +2793,24 @@ export class StaffOperationsService {
                 ? [heuristicTaskDraft]
                 : [];
             const partialPeople = Array.isArray(parsedPlan.people) ? parsedPlan.people : [];
-            if (partialPeople.length || partialTasks.length) {
+            const partialPeopleUpdates = Array.isArray(parsedPlan.people_updates) ? parsedPlan.people_updates : [];
+            const partialTaskUpdates = Array.isArray(parsedPlan.task_updates) ? parsedPlan.task_updates : [];
+            if (partialPeople.length || partialTasks.length || partialPeopleUpdates.length || partialTaskUpdates.length) {
               return {
                 reply:
-                  normalizeGaelReply(trimText(parsedPlan.reply)) ||
-                  "- Prepared the executable part.\n- Confirm to apply.\n- I still need a few missing details.",
+                  buildSingleFollowUpReply(
+                    firstFollowUpQuestion || inferMissingPersonQuestion(message),
+                    "Prepared the executable part."
+                  ) ||
+                  normalizeGaelReply(trimText(parsedPlan.reply)),
                 pendingActions: [
                   buildGaelPlanAction(
                     {
                       ...parsedPlan,
                       people: partialPeople,
                       tasks: partialTasks,
+                      people_updates: partialPeopleUpdates,
+                      task_updates: partialTaskUpdates,
                       requestedSummary: message
                     },
                     threadId,
@@ -2202,8 +2829,8 @@ export class StaffOperationsService {
               };
             }
             const followUpReply =
+              (firstFollowUpQuestion ? buildSingleFollowUpReply(firstFollowUpQuestion) : "") ||
               normalizeGaelReply(trimText(parsedPlan.reply)) ||
-              parsedPlan.followUpQuestions.map((question) => `- ${question}`).join("\n") ||
               normalizeGaelReply(planningResponse.reply) ||
               "- Need more detail before I can prepare an executable plan.";
             return {
@@ -2223,9 +2850,10 @@ export class StaffOperationsService {
 
         const planningFallbackReply = normalizeGaelReply(planningResponse.reply);
         if (heuristicTaskDraft) {
+          const singleFollowUpQuestion = mentionsPeopleRequest ? inferMissingPersonQuestion(message) : "";
           return {
             reply: mentionsPeopleRequest
-              ? "- Prepared the task plan.\n- Confirm to apply.\n- Send staff names if you want people added too."
+              ? buildSingleFollowUpReply(singleFollowUpQuestion, "Prepared the task plan.")
               : "- Prepared the task plan.\n- Confirm to apply.",
             pendingActions: [
               buildGaelPlanAction(
@@ -2244,13 +2872,14 @@ export class StaffOperationsService {
               gael_stop_reason: trimText(planningResponse.stop_reason),
               gael_usage: planningResponse.usage || {},
               gael_plan_parse_failed: true,
-              gael_heuristic_plan: true
+              gael_heuristic_plan: true,
+              ...(mentionsPeopleRequest ? { gael_needs_follow_up: true, gael_partial_plan: true } : {})
             }
           };
         }
         if (mentionsPeopleRequest && looksLikeGaelPlanningRequest(message)) {
           return {
-            reply: "- I need staff names before I can add people.\n- I can still schedule the task once details are clear.",
+            reply: buildSingleFollowUpReply(inferMissingPersonQuestion(message)),
             pendingActions: [],
             metadata: {
               gael_connected: true,
