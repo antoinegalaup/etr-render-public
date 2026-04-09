@@ -508,6 +508,28 @@ function hasGaelPlanChanges(plan = {}) {
   return Boolean((Array.isArray(plan.people) && plan.people.length) || (Array.isArray(plan.tasks) && plan.tasks.length));
 }
 
+function hasNamedStaffHints(message = "") {
+  const propertyNames = new Set(
+    PROPERTY_OPTIONS.flatMap((entry) => [entry.name, ...(entry.aliases || [])]).map((value) =>
+      trimText(value).toLowerCase()
+    )
+  );
+  const ignoredTokens = new Set([
+    "today",
+    "tomorrow",
+    "morning",
+    "afternoon",
+    "evening",
+    "arrival",
+    "departure"
+  ]);
+  const matches = `${message || ""}`.match(/\b[A-Z][a-z]+(?:\s+[A-Z][a-z]+)?\b/g) || [];
+  return matches.some((entry) => {
+    const normalized = trimText(entry).toLowerCase();
+    return normalized && !ignoredTokens.has(normalized) && !propertyNames.has(normalized);
+  });
+}
+
 function buildGaelPlanAction(plan, threadId, actor = {}) {
   const summary = buildGaelPlanSummary(plan);
   return {
@@ -2041,6 +2063,35 @@ export class StaffOperationsService {
         : [{ role: "user", content: trimText(message) }];
       const lowerMessage = `${message || ""}`.toLowerCase();
       const mentionsPeopleRequest = /(employee|manager|staff|person|people|team)/.test(lowerMessage);
+      const deterministicTaskDraft = buildAgentTaskDraft(message);
+      if (
+        deterministicTaskDraft &&
+        looksLikeGaelPlanningRequest(message) &&
+        !hasNamedStaffHints(message)
+      ) {
+        return {
+          reply: mentionsPeopleRequest
+            ? "- Prepared the task plan.\n- Confirm to apply.\n- Send staff names if you want people added too."
+            : "- Prepared the task plan.\n- Confirm to apply.",
+          pendingActions: [
+            buildGaelPlanAction(
+              {
+                requestedSummary: message,
+                people: [],
+                tasks: [deterministicTaskDraft]
+              },
+              threadId,
+              actor
+            )
+          ],
+          metadata: {
+            gael_connected: true,
+            gael_model: "heuristic",
+            gael_heuristic_plan: true,
+            gael_bypassed_model: true
+          }
+        };
+      }
       let dashboardSummary = "Live dashboard summary is currently unavailable.";
       let peopleDirectorySummary = "Current active staff directory is unavailable.";
       let dashboard = null;
