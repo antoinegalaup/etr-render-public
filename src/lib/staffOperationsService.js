@@ -115,6 +115,72 @@ function normalizeGaelReply(value) {
   return normalizedLines.join("\n");
 }
 
+function classifyVincentError(error) {
+  const message = trimText(error?.message || error).replace(/^vincent_request_failed:/i, "");
+  if (!message) {
+    return {
+      code: "unknown",
+      detail: "",
+      reply: "Vincent is temporarily unavailable right now. Please try again shortly."
+    };
+  }
+  if (/too many requests|rate limit|429/i.test(message)) {
+    return {
+      code: "rate_limited",
+      detail: message,
+      reply: "Vincent is busy right now. Please try again in a minute."
+    };
+  }
+  if (/timed out|timeout|abort/i.test(message)) {
+    return {
+      code: "timeout",
+      detail: message,
+      reply: "Vincent is taking too long to respond right now. Please try again shortly."
+    };
+  }
+  return {
+    code: "upstream_unavailable",
+    detail: message,
+    reply: "Vincent is temporarily unavailable right now. Please try again shortly."
+  };
+}
+
+function classifyGaelError(error) {
+  const message = trimText(error?.message || error).replace(/^anthropic_request_failed:/i, "");
+  if (!message) {
+    return {
+      code: "unknown",
+      detail: "",
+      reply: "Gael is temporarily unavailable right now. Please try again shortly."
+    };
+  }
+  if (/too many requests|rate limit|429/i.test(message)) {
+    return {
+      code: "rate_limited",
+      detail: message,
+      reply: "Gael is busy right now. Please try again in a minute."
+    };
+  }
+  if (/timed out|timeout|abort/i.test(message)) {
+    return {
+      code: "timeout",
+      detail: message,
+      reply: "Gael is taking too long to respond right now. Please try again shortly."
+    };
+  }
+  return {
+    code: "upstream_unavailable",
+    detail: message,
+    reply: "Gael is temporarily unavailable right now. Please try again shortly."
+  };
+}
+
+function isRecoverableGaelServiceError(error) {
+  return /anthropic_request_failed|fetch failed|timeout|timed out|abort/i.test(
+    trimText(error?.message || error)
+  );
+}
+
 function buildActor(actor = {}, fallbackSource = "user") {
   const staffRole = trimText(actor.staffRole || actor.staff_role).toLowerCase() || null;
   return {
@@ -2603,42 +2669,57 @@ export class StaffOperationsService {
       }
 
       let vincentSessionId = trimText(context.vincentSessionId);
-      if (!vincentSessionId) {
-        const createdSession = await this.vincentService.createSession({
-          purpose: `staff thread ${threadId} for ${actor.email || actor.userId || "unknown_staff"}`
-        });
-        vincentSessionId = trimText(createdSession.session_id);
-      }
-
-      const vincentResponse = await this.vincentService.sendMessage(vincentSessionId, {
-        message,
-        maxOutputTokens: interactionMode === "voice_call" ? 300 : 700
-      });
-
-      return {
-        reply:
-          trimText(vincentResponse.reply) ||
-          `${conciseLead}Vincent did not return a reply.`,
-        pendingActions: [],
-        metadata: {
-          vincent_connected: true,
-          vincent_session_id: vincentSessionId,
-          vincent_citations: Array.isArray(vincentResponse.citations)
-            ? vincentResponse.citations
-            : [],
-          vincent_website_paths: Array.isArray(vincentResponse.website_paths_considered)
-            ? vincentResponse.website_paths_considered
-            : [],
-          vincent_recommended_actions: Array.isArray(vincentResponse.recommended_actions)
-            ? vincentResponse.recommended_actions
-            : [],
-          vincent_needs_follow_up: Boolean(vincentResponse.needs_follow_up),
-          vincent_tools_used: Array.isArray(vincentResponse.tools_used)
-            ? vincentResponse.tools_used
-            : [],
-          vincent_model: trimText(vincentResponse.model)
+      try {
+        if (!vincentSessionId) {
+          const createdSession = await this.vincentService.createSession({
+            purpose: `staff thread ${threadId} for ${actor.email || actor.userId || "unknown_staff"}`
+          });
+          vincentSessionId = trimText(createdSession.session_id);
         }
-      };
+
+        const vincentResponse = await this.vincentService.sendMessage(vincentSessionId, {
+          message,
+          maxOutputTokens: interactionMode === "voice_call" ? 300 : 700
+        });
+
+        return {
+          reply:
+            trimText(vincentResponse.reply) ||
+            `${conciseLead}Vincent did not return a reply.`,
+          pendingActions: [],
+          metadata: {
+            vincent_connected: true,
+            vincent_session_id: vincentSessionId,
+            vincent_citations: Array.isArray(vincentResponse.citations)
+              ? vincentResponse.citations
+              : [],
+            vincent_website_paths: Array.isArray(vincentResponse.website_paths_considered)
+              ? vincentResponse.website_paths_considered
+              : [],
+            vincent_recommended_actions: Array.isArray(vincentResponse.recommended_actions)
+              ? vincentResponse.recommended_actions
+              : [],
+            vincent_needs_follow_up: Boolean(vincentResponse.needs_follow_up),
+            vincent_tools_used: Array.isArray(vincentResponse.tools_used)
+              ? vincentResponse.tools_used
+              : [],
+            vincent_model: trimText(vincentResponse.model)
+          }
+        };
+      } catch (error) {
+        const fallback = classifyVincentError(error);
+        return {
+          reply: `${conciseLead}${fallback.reply}`,
+          pendingActions: [],
+          metadata: {
+            vincent_connected: true,
+            vincent_degraded: true,
+            vincent_error_code: fallback.code,
+            vincent_error: fallback.detail,
+            vincent_session_id: vincentSessionId || null
+          }
+        };
+      }
     }
 
     if (resolvedAgentId === "gael") {
@@ -2750,12 +2831,71 @@ export class StaffOperationsService {
           `Current staff user: ${actor.email || actor.userId || "unknown"}`
         ].join(" ");
 
-        const planningResponse = await this.gaelService.sendConversation({
-          system: planningSystem,
-          messages: anthropicMessages,
-          maxOutputTokens: interactionMode === "voice_call" ? 320 : 700,
-          temperature: 0.1
-        });
+        let planningResponse;
+        try {
+          planningResponse = await this.gaelService.sendConversation({
+            system: planningSystem,
+            messages: anthropicMessages,
+            maxOutputTokens: interactionMode === "voice_call" ? 320 : 700,
+            temperature: 0.1
+          });
+        } catch (error) {
+          if (!isRecoverableGaelServiceError(error)) {
+            throw error;
+          }
+          const fallback = classifyGaelError(error);
+          if (deterministicTaskDraft) {
+            const singleFollowUpQuestion = mentionsPeopleRequest ? inferMissingPersonQuestion(message) : "";
+            return {
+              reply: mentionsPeopleRequest
+                ? buildSingleFollowUpReply(singleFollowUpQuestion, "Prepared the task plan.")
+                : "- Prepared the task plan.\n- Confirm to apply.",
+              pendingActions: [
+                buildGaelPlanAction(
+                  {
+                    requestedSummary: message,
+                    people: [],
+                    tasks: [deterministicTaskDraft]
+                  },
+                  threadId,
+                  actor
+                )
+              ],
+              metadata: {
+                gael_connected: true,
+                gael_degraded: true,
+                gael_error_code: fallback.code,
+                gael_error: fallback.detail,
+                gael_model: "heuristic",
+                gael_heuristic_plan: true,
+                ...(mentionsPeopleRequest ? { gael_needs_follow_up: true, gael_partial_plan: true } : {})
+              }
+            };
+          }
+          if (mentionsPeopleRequest && looksLikeGaelPlanningRequest(message)) {
+            return {
+              reply: buildSingleFollowUpReply(inferMissingPersonQuestion(message)),
+              pendingActions: [],
+              metadata: {
+                gael_connected: true,
+                gael_degraded: true,
+                gael_error_code: fallback.code,
+                gael_error: fallback.detail,
+                gael_needs_follow_up: true
+              }
+            };
+          }
+          return {
+            reply: `${conciseLead}${fallback.reply}`,
+            pendingActions: [],
+            metadata: {
+              gael_connected: true,
+              gael_degraded: true,
+              gael_error_code: fallback.code,
+              gael_error: fallback.detail
+            }
+          };
+        }
         const heuristicTaskDraft = buildAgentTaskDraft(message);
         const parsedPlan = normalizeGaelPlan(extractJsonObject(planningResponse.reply), message);
         if (parsedPlan) {
@@ -2921,11 +3061,29 @@ export class StaffOperationsService {
         dashboardSummary,
         `Current staff user: ${actor.email || actor.userId || "unknown"}`
       ].join(" ");
-      const gaelResponse = await this.gaelService.sendConversation({
-        system: systemContext,
-        messages: anthropicMessages,
-        maxOutputTokens: interactionMode === "voice_call" ? 220 : 350
-      });
+      let gaelResponse;
+      try {
+        gaelResponse = await this.gaelService.sendConversation({
+          system: systemContext,
+          messages: anthropicMessages,
+          maxOutputTokens: interactionMode === "voice_call" ? 220 : 350
+        });
+      } catch (error) {
+        if (!isRecoverableGaelServiceError(error)) {
+          throw error;
+        }
+        const fallback = classifyGaelError(error);
+        return {
+          reply: `${conciseLead}${fallback.reply}`,
+          pendingActions: [],
+          metadata: {
+            gael_connected: true,
+            gael_degraded: true,
+            gael_error_code: fallback.code,
+            gael_error: fallback.detail
+          }
+        };
+      }
 
       return {
         reply:
